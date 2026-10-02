@@ -1,0 +1,6 @@
+duckdb>=1.5
+fastapi>=0.115
+uvicorn[standard]>=0.30
+xlsxwriter>=3.2
+psycopg[binary]>=3.2
+requests>=2.31

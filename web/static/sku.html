@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Анализ артикула</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/common.js"></script>
+</head>
+<body>
+<header>
+  <h1>Анализ артикула</h1>
+  <a class="meta" href="/" style="color:var(--accent);text-decoration:none">← все товары</a>
+  <button type="button" class="theme-btn" id="themeBtn" aria-label="Переключить тему"></button>
+</header>
+<main>
+  <section class="card sku-head" id="head"><div class="sub">загрузка…</div></section>
+
+  <section class="card filters">
+    <div class="fgroup">
+      <label class="lbl" for="d1">Период</label>
+      <input type="date" id="d1"> — <input type="date" id="d2">
+      <select id="preset" aria-label="Быстрый выбор периода">
+        <option value="">быстрый выбор…</option>
+        <option value="30">последние 30 дней</option>
+        <option value="90">последние 3 месяца</option>
+        <option value="365">последний год</option>
+        <option value="ytd">с начала года</option>
+        <option value="lastyear">прошлый год</option>
+        <option value="all">вся история артикула</option>
+      </select>
+    </div>
+    <div class="fgroup">
+      <span class="lbl">Разбивка</span>
+      <span class="seg" id="grain">
+        <button type="button" data-g="day">по дням</button><button type="button" data-g="week">по неделям</button><button type="button" data-g="month">по месяцам</button>
+      </span>
+    </div>
+  </section>
+
+  <section class="kpis" id="kpis"></section>
+  <section class="card chart-card">
+    <div class="head"><h3>Динамика</h3><span class="sub" id="chartSub"></span><div class="toggles" id="chartToggles"></div></div>
+    <div class="mchart" id="chart"></div>
+  </section>
+
+  <section class="card table-card">
+    <div class="toolbar">
+      <span class="info" id="tinfo"></span>
+      <span class="grow"></span>
+      <button class="btn" id="expCsv">Скачать CSV</button>
+    </div>
+    <div class="table-wrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div>
+  </section>
+</main>
+<div class="status" id="status"></div>
+
+<script>
+"use strict";
+const [, , PLATFORM, SKU] = location.pathname.split("/").map(decodeURIComponent);
+let META = null, INFO = null, chart = null;
+const S = {d1: null, d2: null, grain: "day", sort: "t", desc: false};
+
+// ---------------------------------------------------------------- состояние в адресе: #d1=…&d2=…&grain=…
+function loadHash() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  for (const k of ["d1", "d2", "grain"]) if (h.get(k)) S[k] = h.get(k);
+  if (!["day", "week", "month"].includes(S.grain)) S.grain = "day";
+}
+function saveHash() { history.replaceState(null, "", `#d1=${S.d1}&d2=${S.d2}&grain=${S.grain}`); }
+
+// ---------------------------------------------------------------- расчёт по дневным строкам (всё в браузере)
+function weekStart(iso) {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() - (d.getUTCDay() + 6) % 7);
+  return d.toISOString().slice(0, 10);
+}
+const bucket = (iso, g) => g === "month" ? iso.slice(0, 8) + "01" : g === "week" ? weekStart(iso) : iso;
+function nextBucket(iso, g) {
+  if (g === "month") { const d = new Date(iso + "T00:00:00Z"); d.setUTCMonth(d.getUTCMonth() + 1); return d.toISOString().slice(0, 10); }
+  return shiftDays(iso, g === "week" ? 7 : 1);
+}
+function aggregate() {
+  const days = INFO.days.filter(d => d[0] >= S.d1 && d[0] <= S.d2);  // [dt, revenue, orders, price, anomaly]
+  const map = new Map();
+  for (const [dt, rev, ord, price, anom] of days) {
+    const b = bucket(dt, S.grain);
+    let r = map.get(b);
+    if (!r) map.set(b, r = {t: b, revenue: 0, orders: 0, days: 0, priceSum: 0, priceN: 0, anomaly: false});
+    r.revenue += rev; r.orders += ord || 0; r.days += 1; r.anomaly = r.anomaly || anom;
+    if (price != null) { r.priceSum += price; r.priceN += 1; }
+  }
+  const rows = [...map.values()].map(r => ({...r, avg_check: r.orders ? Math.round(r.revenue / r.orders) : null,
+    price: r.priceN ? Math.round(r.priceSum / r.priceN) : null}));
+  // для графика — все периоды подряд, без продаж = 0
+  const points = [];
+  if (S.d1 <= S.d2) {
+    for (let b = bucket(S.d1, S.grain), n = 0; b <= S.d2 && n < 5000; b = nextBucket(b, S.grain), n++) {
+      const r = map.get(b);
+      points.push(r ? {t: b, revenue: r.revenue, orders: r.orders, avg_check: r.orders ? Math.round(r.revenue / r.orders) : null}
+                    : {t: b, revenue: 0, orders: 0, avg_check: null});
+    }
+  }
+  return {days, rows, points};
+}
+
+// ---------------------------------------------------------------- отрисовка
+// ссылка на главную страницу с фильтром по значению (бренд, продавец, категория, сегмент) за текущий период
+function drillUrl(field, id, name) {
+  const f = {d1: S.d1, d2: S.d2, [field]: [id]};
+  if (field === "category") f.segment = [];  // категория может быть в сегменте, скрытом по умолчанию («Прочее»)
+  const st = {f};
+  if (field !== "segment") st.names = {[field]: {[id]: name}};
+  return "/#" + encodeURIComponent(JSON.stringify(st));
+}
+function drill(field, id, name) {
+  if (id == null) return esc(name);
+  return `<a class="drill" data-field="${field}" data-id="${id}" data-name="${esc(name)}" href="${drillUrl(field, id, name)}" title="Все товары: ${esc(name)}">${esc(name)}</a>`;
+}
+// период на странице меняется — ссылки обновляем
+function updateDrills() {
+  document.querySelectorAll("a.drill").forEach(a => a.href = drillUrl(a.dataset.field, +a.dataset.id, a.dataset.name));
+}
+function renderHead() {
+  const p = +PLATFORM;
+  document.title = `${SKU} — ${INFO.name || "артикул"}`;
+  const first = INFO.days.length ? INFO.days[0][0] : null, last = INFO.days.length ? INFO.days[INFO.days.length - 1][0] : null;
+  $("head").innerHTML = `
+    <h2>${esc(INFO.name || "без названия")}</h2>
+    <div class="facts">
+      <span>${PLATFORM_NAMES[p]} · артикул <b>${esc(SKU)}</b></span>
+      <span>Бренд: <b>${INFO.brand ? drill("brand", INFO.brand_id, INFO.brand) : "—"}</b></span>
+      <span>Продавец: <b>${INFO.seller ? drill("seller", INFO.seller_id, INFO.seller) : "—"}</b></span>
+      <span>Категория: <b>${INFO.categories.map(x => drill("category", x.id, x.name)).join(", ") || "—"}</b></span>
+      <span>Сегмент: <b>${INFO.segments.map(x => drill("segment", x.id, x.name)).join(", ") || "—"}</b></span>
+      <span>Продажи в данных: <b>${first ? fmtDate(first) + " — " + fmtDate(last) : "нет"}</b></span>
+    </div>
+    <div class="links"><a href="${mpUrl(p, SKU)}" target="_blank" rel="noopener">Открыть на ${PLATFORM_NAMES[p]} ↗</a></div>`;
+}
+
+function render() {
+  saveHash();
+  updateDrills();
+  $("d1").value = S.d1; $("d2").value = S.d2;
+  $("grain").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.g === S.grain));
+  const {days, rows, points} = aggregate();
+
+  const rev = days.reduce((a, d) => a + d[1], 0), ord = days.reduce((a, d) => a + (d[2] || 0), 0);
+  const prices = days.map(d => d[3]).filter(v => v != null);
+  const kp = [
+    ["Выручка", fmtBig(rev, "₽"), fmt(rev) + " ₽"],
+    ["Заказы", fmtBig(ord, "шт"), fmt(ord) + " шт"],
+    ["Средний чек", ord ? fmt(Math.round(rev / ord)) + " ₽" : "—", "выручка / заказы"],
+    ["Дней с продажами", fmt(days.length), `из ${fmt(Math.round((new Date(S.d2) - new Date(S.d1)) / 864e5) + 1)} дней периода`],
+    ["Выручка в день продаж", days.length ? fmtBig(Math.round(rev / days.length), "₽") : "—", "в среднем"],
+    ["Цена", prices.length ? `${fmt(Math.min(...prices))} – ${fmt(Math.max(...prices))} ₽` : "—", "минимум – максимум за период"],
+  ];
+  $("kpis").innerHTML = kp.map(([k, v, s]) => `<div class="card kpi"><div class="k">${k}</div><div class="v" title="${esc(s)}">${v}</div><div class="s">${esc(s)}</div></div>`).join("");
+
+  $("chartSub").textContent = GRAIN_NAMES[S.grain] + (points.length ? "" : "");
+  if (!chart) chart = new MetricsChart($("chart"), $("chartToggles"), "mpstats.metrics");
+  chart.set(points, S.grain);
+  renderTable(rows);
+}
+
+const TCOLS = [
+  {key: "t", label: "Период", num: false},
+  {key: "revenue", label: "Выручка, ₽", num: true},
+  {key: "orders", label: "Заказы, шт", num: true},
+  {key: "avg_check", label: "Средний чек, ₽", num: true},
+  {key: "price", label: "Цена, ₽", num: true, hint: "цена из данных MPSTATS; за неделю/месяц — средняя по дням"},
+  {key: "days", label: "Дней с продажами", num: true, grains: ["week", "month"]},
+];
+let lastRows = [];
+function renderTable(rows) {
+  lastRows = rows;
+  const cols = TCOLS.filter(c => !c.grains || c.grains.includes(S.grain));
+  const sorted = [...rows].sort((a, b) => {
+    const x = a[S.sort], y = b[S.sort];
+    const r = x == null ? 1 : y == null ? -1 : x < y ? -1 : x > y ? 1 : 0;
+    return S.desc ? -r : r;
+  });
+  $("thead").innerHTML = "<tr>" + cols.map(c => `<th class="sortable ${c.num ? "num" : ""}" data-k="${c.key}" ${c.hint ? `title="${esc(c.hint)}"` : ""}>${esc(c.label)}${S.sort === c.key ? (S.desc ? " ↓" : " ↑") : ""}</th>`).join("") + "</tr>";
+  $("tbody").innerHTML = sorted.map(r => `<tr class="${r.anomaly ? "anom" : ""}" ${r.anomaly ? 'title="аномальный период"' : ""}>` + cols.map(c =>
+    c.key === "t" ? `<td>${periodLabel(r.t, S.grain)}</td>` : `<td class="num">${fmt(r[c.key])}</td>`).join("") + "</tr>").join("")
+    || `<tr><td colspan="${cols.length}" style="color:var(--muted);padding:24px">Нет продаж за выбранный период</td></tr>`;
+  $("thead").querySelectorAll("th").forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    if (S.sort === k) S.desc = !S.desc; else { S.sort = k; S.desc = k !== "t"; }
+    renderTable(lastRows);
+  });
+  $("tinfo").textContent = `Строк: ${fmt(rows.length)} (периоды с продажами)`;
+}
+
+$("expCsv").onclick = () => {
+  const cols = TCOLS.filter(c => !c.grains || c.grains.includes(S.grain));
+  const lines = [cols.map(c => c.label).join(";")].concat(lastRows.map(r => cols.map(c => c.key === "t" ? periodLabel(r.t, S.grain) : (r[c.key] ?? "")).join(";")));
+  const blob = new Blob(["﻿" + lines.join("\r\n")], {type: "text/csv"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = `sku_${SKU}_${S.d1}_${S.d2}_${S.grain}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+};
+
+// ---------------------------------------------------------------- управление
+$("d1").onchange = () => { if ($("d1").value) { S.d1 = $("d1").value; if (S.d1 > S.d2) S.d2 = S.d1; render(); } };
+$("d2").onchange = () => { if ($("d2").value) { S.d2 = $("d2").value; if (S.d1 > S.d2) S.d1 = S.d2; render(); } };
+$("preset").onchange = () => {
+  const v = $("preset").value, max = META.max_dt, y = +max.slice(0, 4);
+  if (!v) return;
+  if (v === "all") { S.d1 = INFO.days.length ? INFO.days[0][0] : META.min_dt; S.d2 = INFO.days.length ? INFO.days[INFO.days.length - 1][0] : max; }
+  else if (v === "ytd") { S.d1 = `${y}-01-01`; S.d2 = max; }
+  else if (v === "lastyear") { S.d1 = `${y - 1}-01-01`; S.d2 = `${y - 1}-12-31`; }
+  else { S.d1 = shiftDays(max, -(+v) + 1); S.d2 = max; }
+  $("preset").value = ""; render();
+};
+$("grain").querySelectorAll("button").forEach(b => b.onclick = () => { S.grain = b.dataset.g; render(); });
+document.addEventListener("themechange", () => { if (chart) chart.draw(); });
+
+(async () => {
+  try {
+    status("Загружаю…");
+    [META, INFO] = await Promise.all([
+      api("/api/meta").then(r => r.json()),
+      api(`/api/sku?platform=${encodeURIComponent(PLATFORM)}&sku=${encodeURIComponent(SKU)}`).then(r => r.json()),
+    ]);
+    loadHash();
+    if (!S.d1 || !S.d2) {  // без периода в ссылке — вся история артикула
+      S.d1 = INFO.days.length ? INFO.days[0][0] : shiftDays(META.max_dt, -89);
+      S.d2 = INFO.days.length ? INFO.days[INFO.days.length - 1][0] : META.max_dt;
+    }
+    if (!location.hash.includes("grain=")) {  // разбивка по умолчанию — по длине периода
+      const n = (new Date(S.d2) - new Date(S.d1)) / 864e5;
+      S.grain = n <= 92 ? "day" : n <= 400 ? "week" : "month";
+    }
+    renderHead();
+    render();
+    status("");
+  } catch (e) { status("Ошибка: " + e.message, true); $("head").innerHTML = `<div class="sub">${esc(e.message)}</div>`; }
+})();
+</script>
+</body>
+</html>

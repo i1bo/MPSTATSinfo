@@ -1,0 +1,15 @@
+.git
+.gitignore
+.dockerignore
+.env
+.venv
+.claude
+data
+logs
+**/__pycache__
+**/*.duckdb
+**/*.duckdb.wal
+*.xlsx
+TODO.md
+Новый текстовый документ.txt
+пример выгрузки.txt

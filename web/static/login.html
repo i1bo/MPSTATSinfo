@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход — Продажи MPSTATS</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/common.js"></script>
+</head>
+<body class="login-body">
+<main class="login-wrap">
+  <form class="card login-card" method="post" action="/login" id="form">
+    <h1>Продажи MPSTATS</h1>
+    {{error}}
+    <label class="lbl" for="user" {{user_hidden}}>Логин</label>
+    <input class="in" id="user" name="user" value="{{user}}" autocomplete="username" {{user_hidden}}>
+    <label class="lbl" for="password">Пароль</label>
+    <input class="in" id="password" name="password" type="password" autocomplete="current-password" required>
+    <input type="hidden" name="next" id="next" value="{{next}}">
+    <button class="btn primary" type="submit">Войти</button>
+  </form>
+</main>
+<script>
+"use strict";
+// фильтры главной страницы хранятся в адресе после «#» — сервер его не видит, поэтому дописываем при входе
+$("form").addEventListener("submit", () => { if (location.hash) $("next").value += location.hash; });
+($("user").hidden || $("user").value ? $("password") : $("user")).focus();
+</script>
+</body>
+</html>

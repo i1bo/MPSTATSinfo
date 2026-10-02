@@ -1,0 +1,46 @@
+# Сайт:                docker compose up -d --build
+# Пересобрать DuckDB:  docker compose run --rm build-db && docker compose restart web
+# Выгрузка MPSTATS:    docker compose run --rm loader run --platform wb      (любая команда loader.py)
+#
+# Настройки — в .env (см. .env.example). Файл DuckDB лежит в ./data на сервере, в образ не попадает.
+# Postgres в этот файл не входит: PG_DSN в .env должен указывать на существующую базу
+# (Postgres на самом сервере — хост host.docker.internal вместо localhost).
+
+x-app: &app
+  build: .
+  image: mpstats-web
+  env_file: .env
+  environment:
+    DUCKDB_PATH: /app/data/mpstats.duckdb
+  volumes:
+    - ./data:/app/data
+    - ./logs:/app/logs
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  web:
+    <<: *app
+    environment:
+      DUCKDB_PATH: /app/data/mpstats.duckdb
+      TMPDIR: /cache          # кэш результатов фильтров и временные файлы выгрузки
+    volumes:
+      - ./data:/app/data:ro
+      - cache:/cache
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  build-db:
+    <<: *app
+    profiles: ["tools"]
+    command: ["python", "web/build_duckdb.py"]
+
+  loader:
+    <<: *app
+    profiles: ["tools"]
+    entrypoint: ["python", "-u", "loader.py"]
+    command: ["status"]
+
+volumes:
+  cache:

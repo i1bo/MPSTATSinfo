@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Продажи MPSTATS</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/common.js"></script>
+</head>
+<body>
+<header>
+  <h1>Продажи MPSTATS</h1>
+  <span class="info-dot" tabindex="0" aria-describedby="meta">i<span class="tip" id="meta" role="tooltip">загрузка…</span></span>
+  <button type="button" class="theme-btn" id="themeBtn" aria-label="Переключить тему"></button>
+</header>
+<main>
+  <section class="card filters" id="filters">
+    <div class="fgroup">
+      <label class="lbl" for="d1">Период</label>
+      <input type="date" id="d1"> — <input type="date" id="d2">
+      <select id="preset" aria-label="Быстрый выбор периода">
+        <option value="">быстрый выбор…</option>
+        <option value="30">последние 30 дней</option>
+        <option value="90">последние 3 месяца</option>
+        <option value="365">последний год</option>
+        <option value="ytd">с начала года</option>
+        <option value="lastyear">прошлый год</option>
+        <option value="all">всё время</option>
+      </select>
+    </div>
+    <div class="fgroup" id="topFilters"></div>
+    <label class="chip" id="anomalyChip"><input type="checkbox" id="exclAnomaly"> без аномальных периодов</label>
+    <button class="btn" id="reset">Сбросить фильтры</button>
+    <div class="active-filters" id="active" style="flex-basis:100%"></div>
+  </section>
+
+  <div id="dash">
+    <section class="kpis" id="kpis"></section>
+    <section class="card chart-card">
+      <div class="head"><h3>Динамика</h3><span class="seg" id="grain" role="group" aria-label="Разбивка графика">
+        <button type="button" data-g="auto" title="По длине периода: до 2 месяцев — по дням, до года — по неделям, дольше — по месяцам">авто</button><button type="button" data-g="day">по дням</button><button type="button" data-g="week">по неделям</button><button type="button" data-g="month">по месяцам</button>
+      </span><span class="sub" id="chartSub"></span><div class="toggles" id="chartToggles"></div></div>
+      <div class="mchart" id="chart"></div>
+    </section>
+  </div>
+
+  <section class="card table-card">
+    <div class="toolbar">
+      <span class="info" id="tinfo"></span>
+      <span class="grow"></span>
+      <div class="pager">
+        <button class="btn small" id="first" aria-label="Первая страница">«</button>
+        <button class="btn small" id="prev" aria-label="Предыдущая страница">‹</button>
+        <span id="pageinfo"></span>
+        <button class="btn small" id="next" aria-label="Следующая страница">›</button>
+        <button class="btn small" id="last" aria-label="Последняя страница">»</button>
+        <select id="psize" aria-label="Строк на странице">
+          <option>50</option><option selected>100</option><option>250</option><option>500</option>
+        </select>
+      </div>
+      <button class="btn" id="expXlsx">Скачать Excel</button>
+      <button class="btn" id="expCsv">Скачать CSV</button>
+    </div>
+    <div class="table-wrap" id="twrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div>
+  </section>
+    <section class="shares" id="sharesBox">
+      <div class="card share-card"><h3>Доли брендов в выручке</h3><div class="sub">топ-10, клик — отфильтровать по бренду</div><div id="sh-brand"></div></div>
+      <div class="card share-card"><h3>Доли продавцов в выручке</h3><div class="sub">топ-10, клик — отфильтровать по продавцу</div><div id="sh-seller"></div></div>
+    </section>
+</main>
+<div class="status" id="status"></div>
+
+<script>
+"use strict";
+let META = null;
+const COLS = {};          // key -> {label, type}
+// состояние: фильтры + сортировка + страница + имена выбранных значений (для подписей)
+let S = null;
+// сегмент «Прочее» (случайно попавшие категории) по умолчанию выключен
+const defaultSegments = () => META.segments.some(x => x.default_off) ? META.segments.filter(x => !x.default_off).map(x => x.id) : [];
+function defaultState() {
+  const d2 = META.max_dt, d1 = shiftDays(d2, -89);
+  return {f: {d1, d2, platform: [], segment: defaultSegments(), category: [], category_exclude: false, brand: [], brand_exclude: false,
+              seller: [], seller_exclude: false, exclude_anomaly: true, sku: [], name: null, num: {}},
+          sort: "revenue", desc: true, page: 1, page_size: 100, grain: "auto", names: {brand: {}, seller: {}, category: {}}};
+}
+
+// ---------------------------------------------------------------- адрес страницы = состояние
+function saveHash() { history.replaceState(null, "", "#" + encodeURIComponent(JSON.stringify(S))); }
+function loadHash() {
+  try {
+    if (location.hash.length > 1) {
+      // ссылка может задавать только часть фильтров (например, со страницы артикула) — остальное по умолчанию
+      const h = JSON.parse(decodeURIComponent(location.hash.slice(1))), def = defaultState();
+      const s = Object.assign(def, h, {f: Object.assign(def.f, h.f), names: Object.assign(def.names, h.names)});
+      for (const k of ["brand", "seller", "category"]) s.names[k] = s.names[k] || {};
+      // ссылки со старыми столбцами (группировка, последняя цена) — чистим
+      delete s.f.group;
+      if (!COLS[s.sort]) s.sort = "revenue";
+      if (!["auto", "day", "week", "month"].includes(s.grain)) s.grain = "auto";
+      for (const k of Object.keys(s.f.num || {})) if (!COLS[k]) delete s.f.num[k];
+      return s;
+    }
+  }
+  catch (e) { console.warn(e); }
+  return defaultState();
+}
+
+// ---------------------------------------------------------------- сеть
+let seq = 0;
+let ctrl = null;
+async function refresh(what = "all") {
+  saveHash();
+  renderControls();
+  const my = ++seq;
+  if (ctrl) ctrl.abort();
+  ctrl = new AbortController();
+  const t0 = performance.now();
+  const timer = setInterval(() => status(`Считаю… ${((performance.now() - t0) / 1000).toFixed(0)} с`), 500);
+  status("Считаю…");
+  // what: "all" — таблица и сводка, "rows" — только таблица, "chart" — только сводка (смена разбивки графика)
+  if (what !== "rows") { $("dash").classList.add("loading"); $("sharesBox").classList.add("loading"); }
+  if (what !== "chart") $("twrap").classList.add("loading");
+  try {
+    const rowsP = what !== "chart" ? api("/api/rows", {filters: S.f, sort: S.sort, desc: S.desc, page: S.page, page_size: S.page_size}, ctrl.signal).then(r => r.json()) : null;
+    const sumP = what !== "rows" ? api("/api/summary?grain=" + S.grain, S.f, ctrl.signal).then(r => r.json()) : null;
+    if (rowsP) {
+      const rows = await rowsP;
+      if (my !== seq) return;
+      renderTable(rows);
+      $("twrap").classList.remove("loading");
+    }
+    if (sumP) { const sum = await sumP; if (my !== seq) return; renderSummary(sum); $("dash").classList.remove("loading"); $("sharesBox").classList.remove("loading"); }
+    status("");
+    if (rowsP) $("tinfo").dataset.secs = ((performance.now() - t0) / 1000).toFixed(1);
+    updateInfo();
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    status("Ошибка: " + e.message, true);
+    $("dash").classList.remove("loading"); $("sharesBox").classList.remove("loading"); $("twrap").classList.remove("loading");
+  } finally { clearInterval(timer); }
+}
+
+// ---------------------------------------------------------------- верхние фильтры
+function renderControls() {
+  $("d1").value = S.f.d1; $("d2").value = S.f.d2;
+  $("d1").min = $("d2").min = META.min_dt; $("d1").max = $("d2").max = META.max_dt;
+  $("exclAnomaly").checked = S.f.exclude_anomaly;
+  $("anomalyChip").classList.toggle("on", S.f.exclude_anomaly);
+  $("grain").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.g === S.grain));
+  $("topFilters").innerHTML = TOP_FILTERS.map(([k, title]) => {
+    const v = filterValue(k);
+    return `<button type="button" class="dd ${v ? "on" : ""}" data-top="${k}" title="${esc(title + ": " + (v || "все"))}"><span class="dt">${title}</span><span class="dv">${esc(v || "все")}</span><span class="caret">▾</span></button>`;
+  }).join("");
+  $("topFilters").querySelectorAll("[data-top]").forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    if (pop && pop.dataset.for === "top-" + b.dataset.top) { closePop(); return; }
+    openFilter(b.dataset.top, b, {top: true});
+  });
+  renderActive();
+}
+// выпадающие фильтры в верхней панели — те же окна фильтров, что в заголовках таблицы
+const TOP_FILTERS = [["platform", "Маркетплейс"], ["segment", "Сегмент"], ["category", "Категория"], ["brand", "Бренд"], ["seller", "Продавец"]];
+function filterValue(k) {
+  const ids = S.f[k];
+  if (!ids.length) return "";
+  if (k === "segment") {
+    const def = defaultSegments(), off = META.segments.filter(x => x.default_off);
+    if (def.length && ids.length === def.length && def.every(id => ids.includes(id)))
+      return "все, кроме " + off.map(x => x.name).join(", ");
+  }
+  if (k === "platform" || k === "segment") {
+    const list = k === "platform" ? META.platforms : META.segments;
+    return ids.map(id => (list.find(x => x.id === id) || {}).name).join(", ");
+  }
+  const ex = S.f[k + "_exclude"];
+  if (ids.length === 1) return (ex ? "кроме " : "") + (S.names[k][ids[0]] || "#" + ids[0]);
+  return ex ? `все, кроме ${fmt(ids.length)}` : `${fmt(ids.length)} выбрано`;
+}
+$("d1").addEventListener("change", () => { if ($("d1").value) { S.f.d1 = $("d1").value; if (S.f.d1 > S.f.d2) S.f.d2 = S.f.d1; S.page = 1; refresh(); } });
+$("d2").addEventListener("change", () => { if ($("d2").value) { S.f.d2 = $("d2").value; if (S.f.d1 > S.f.d2) S.f.d1 = S.f.d2; S.page = 1; refresh(); } });
+$("preset").addEventListener("change", () => {
+  const v = $("preset").value, max = META.max_dt, y = +max.slice(0, 4);
+  if (!v) return;
+  if (v === "all") { S.f.d1 = META.min_dt; S.f.d2 = max; }
+  else if (v === "ytd") { S.f.d1 = `${y}-01-01`; S.f.d2 = max; }
+  else if (v === "lastyear") { S.f.d1 = `${y - 1}-01-01`; S.f.d2 = `${y - 1}-12-31`; }
+  else { S.f.d1 = shiftDays(max, -(+v) + 1); S.f.d2 = max; }
+  $("preset").value = ""; S.page = 1; refresh();
+});
+$("exclAnomaly").addEventListener("change", () => { S.f.exclude_anomaly = $("exclAnomaly").checked; S.page = 1; refresh(); });
+$("reset").addEventListener("click", () => { const keep = {d1: S.f.d1, d2: S.f.d2}, grain = S.grain; S = defaultState(); Object.assign(S.f, keep); S.grain = grain; refresh(); });
+$("grain").querySelectorAll("button").forEach(b => b.onclick = () => { if (S.grain !== b.dataset.g) { S.grain = b.dataset.g; refresh("chart"); } });
+
+const OPS = {gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=", ne: "≠", between: "между"};
+function renderActive() {
+  const tags = [];
+  const nameList = (k, ids) => ids.slice(0, 3).map(i => S.names[k][i] || ("#" + i)).join(", ") + (ids.length > 3 ? ` и ещё ${ids.length - 3}` : "");
+  for (const k of ["brand", "seller", "category"]) {
+    if (S.f[k].length) tags.push([`${COLS[k].label}${S.f[k + "_exclude"] ? " — кроме" : ""}: ${nameList(k, S.f[k])}`, () => { S.f[k] = []; S.f[k + "_exclude"] = false; }]);
+  }
+  if (S.f.sku.length) tags.push([`Артикул: ${S.f.sku.slice(0, 3).join(", ")}${S.f.sku.length > 3 ? ` и ещё ${S.f.sku.length - 3}` : ""}`, () => { S.f.sku = []; }]);
+  if (S.f.name) tags.push([`Наименование ${S.f.name.op === "contains" ? "содержит" : "не содержит"} «${S.f.name.value}»`, () => { S.f.name = null; }]);
+  for (const [k, nf] of Object.entries(S.f.num)) {
+    const txt = nf.op === "between" ? `от ${fmt(nf.a)} до ${fmt(nf.b)}` : `${OPS[nf.op]} ${fmt(nf.a)}`;
+    tags.push([`${COLS[k].label} ${txt}`, () => { delete S.f.num[k]; }]);
+  }
+  $("active").innerHTML = tags.map((t, i) => `<span class="tag"><span title="${esc(t[0])}">${esc(t[0])}</span><button data-i="${i}" aria-label="Убрать фильтр">×</button></span>`).join("");
+  $("active").querySelectorAll("button").forEach(b => b.onclick = () => { tags[+b.dataset.i][1](); S.page = 1; refresh(); });
+}
+
+// ---------------------------------------------------------------- сводка и графики
+let chart = null;
+function renderSummary(s) {
+  const t = s.totals;
+ const kp = [
+    ["Выручка", fmtBig(t.revenue, "₽"), fmt(t.revenue) + " ₽"],
+    ["Заказы", fmtBig(t.orders, "шт"), fmt(t.orders) + " шт"],
+    ["Средний чек", t.avg_check == null ? "—" : fmt(t.avg_check) + " ₽", "выручка / заказы"],
+    ["Товаров с выручкой", fmt(t.rows), "строк в таблице"],
+    ["Брендов", fmt(t.brands), ""],
+    ["Продавцов", fmt(t.sellers), ""],
+    ["Средняя выручка на товар", fmtBig(t.avg_revenue, "₽"), fmt(t.avg_revenue) + " ₽"],
+  ];
+  $("kpis").innerHTML = kp.map(([k, v, s]) => `<div class="card kpi"><div class="k">${k}</div><div class="v" title="${esc(s)}">${v}</div><div class="s">${esc(s)}</div></div>`).join("");
+
+
+  $("chartSub").textContent = S.grain === "auto" ? "авто: " + GRAIN_NAMES[s.series.grain] : "";
+  if (!chart) chart = new MetricsChart($("chart"), $("chartToggles"), "mpstats.metrics");
+  chart.set(s.series.points, s.series.grain);
+  drawShares("sh-brand", s.brands, "brand");
+  drawShares("sh-seller", s.sellers, "seller");
+}
+function drawShares(id, items, field) {
+  const total = items.reduce((a, x) => a + x.revenue, 0) || 1;
+  const max = Math.max(...items.filter(x => x.id != null).map(x => x.revenue), 1);
+  $(id).innerHTML = items.length ? items.map((x, i) => {
+    const share = x.revenue / total;
+    const rest = x.id == null;
+    return `<div class="share-row ${rest ? "rest" : ""}" data-i="${i}" title="${esc(x.name)}: ${fmt(x.revenue)} ₽ (${(share * 100).toFixed(1)}%)">
+      <span class="n">${esc(x.name)}</span>
+      <span class="bar"><i style="width:${Math.max(0.5, (rest ? share : x.revenue / total) * 100).toFixed(2)}%"></i></span>
+      <span class="p">${(share * 100).toFixed(1)}%</span></div>`;
+  }).join("") : `<div class="sub">нет данных</div>`;
+  $(id).querySelectorAll(".share-row:not(.rest)").forEach(r => r.onclick = () => {
+    const x = items[+r.dataset.i];
+    S.f[field] = [x.id]; S.f[field + "_exclude"] = false; S.names[field][x.id] = x.name; S.page = 1; refresh();
+  });
+}
+document.addEventListener("themechange", () => { if (chart) chart.draw(); });
+
+// ---------------------------------------------------------------- таблица
+let lastRows = null, TOTAL = 0;
+const FILTER_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z" fill="currentColor"/></svg>`;
+function colActive(k) {
+  if (["brand", "seller", "category"].includes(k)) return S.f[k].length > 0;
+  if (k === "platform" || k === "segment") return S.f[k].length > 0;
+  if (k === "sku") return S.f.sku.length > 0;
+  if (k === "name") return !!S.f.name;
+  if (k === "anomaly") return S.f.exclude_anomaly;
+  return !!S.f.num[k];
+}
+function renderTable(res) {
+  lastRows = res;
+  const cols = res.columns;
+  $("thead").innerHTML = "<tr>" + cols.map(k => {
+    const c = COLS[k], num = c.type === "num" || c.type === "int";
+    const arrow = S.sort === k ? (S.desc ? " ↓" : " ↑") : "";
+    return `<th class="${num ? "num" : ""}"><div class="h"><span class="t" data-sort="${k}">${esc(c.label)}${arrow}</span><button class="fb ${colActive(k) ? "on" : ""}" data-f="${k}" aria-label="Фильтр: ${esc(c.label)}">${FILTER_ICON}</button></div></th>`;
+  }).join("") + "</tr>";
+  $("tbody").innerHTML = res.rows.map(r => "<tr>" + r.map((v, i) => cell(cols[i], v, r, cols)).join("") + "</tr>").join("")
+    || `<tr><td colspan="${cols.length}" style="color:var(--muted);padding:24px">Нет строк под эти фильтры</td></tr>`;
+  $("thead").querySelectorAll("[data-sort]").forEach(el => el.onclick = () => {
+    const k = el.dataset.sort;
+    if (S.sort === k) S.desc = !S.desc; else { S.sort = k; S.desc = ["num", "int", "date"].includes(COLS[k].type) ? true : false; }
+    S.page = 1; refresh("rows");
+  });
+  $("thead").querySelectorAll("[data-f]").forEach(el => el.onclick = e => { e.stopPropagation(); openFilter(el.dataset.f, el); });
+  TOTAL = res.total;
+  updateInfo();
+}
+function cell(k, v, row, cols) {
+  const t = COLS[k].type;
+  if (k === "sku") {
+    const pl = row[cols.indexOf("platform")] === "Wildberries" ? 1 : 2;
+    return `<td class="num"><a href="${skuUrl(pl, v, S.f.d1, S.f.d2)}" target="_blank" title="Анализ артикула">${v}</a>` +
+      `<a class="mp" href="${mpUrl(pl, v)}" target="_blank" rel="noopener" title="Открыть на ${PLATFORM_NAMES[pl]}">↗</a></td>`;
+  }
+  if (t === "num") return `<td class="num">${fmt(v)}</td>`;
+  if (t === "date") return `<td>${fmtDate(v)}</td>`;
+  if (t === "bool") return `<td>${v ? "да" : ""}</td>`;
+  if (k === "name") return `<td class="name" title="${esc(v)}">${esc(v)}</td>`;
+  return `<td class="dim" title="${esc(v)}">${esc(v)}</td>`;
+}
+function pages() { return Math.max(1, Math.ceil(TOTAL / S.page_size)); }
+function updateInfo() {
+  const secs = $("tinfo").dataset.secs;
+  $("tinfo").textContent = `Строк: ${fmt(TOTAL)}` + (secs ? ` · ${secs} с` : "");
+  $("pageinfo").textContent = `стр. ${fmt(S.page)} из ${fmt(pages())}`;
+  $("first").disabled = $("prev").disabled = S.page <= 1;
+  $("next").disabled = $("last").disabled = S.page >= pages();
+  $("psize").value = S.page_size;
+}
+$("first").onclick = () => { S.page = 1; refresh("rows"); };
+$("prev").onclick = () => { S.page = Math.max(1, S.page - 1); refresh("rows"); };
+$("next").onclick = () => { S.page = Math.min(pages(), S.page + 1); refresh("rows"); };
+$("last").onclick = () => { S.page = pages(); refresh("rows"); };
+$("psize").onchange = () => { S.page_size = +$("psize").value; S.page = 1; refresh("rows"); };
+
+// ---------------------------------------------------------------- всплывающий фильтр столбца
+let pop = null;
+function closePop() { if (pop) { pop.remove(); pop = null; } }
+document.addEventListener("mousedown", e => { if (pop && !pop.contains(e.target) && !e.target.closest("[data-f],[data-top]")) closePop(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") closePop(); });
+
+function openFilter(k, anchor, opts = {}) {
+  closePop();
+  const c = COLS[k];
+  pop = document.createElement("div");
+  pop.className = "pop";
+ const up = ["num", "int", "date"].includes(c.type) ? "По возрастанию" : "А → Я", down = ["num", "int", "date"].includes(c.type) ? "По убыванию" : "Я → А";
+  const title = opts.top ? (TOP_FILTERS.find(x => x[0] === k) || [k, c.label])[1] : c.label;
+  let html = `<h4>${esc(title)}</h4>` + (opts.top ? "" : `<div class="row"><button class="btn small" data-s="asc">${up}</button><button class="btn small" data-s="desc">${down}</button></div>`);
+  pop.dataset.for = (opts.top ? "top-" : "col-") + k;
+  let apply = null, clear = null, after = null;
+
+  if (c.type === "num") {
+    const nf = S.f.num[k] || {op: "gt", a: "", b: ""};
+    html += `<div class="row"><select id="pOp">${Object.entries(OPS).map(([o, t]) => `<option value="${o}" ${nf.op === o ? "selected" : ""}>${t}</option>`).join("")}</select>
+      <input class="in" id="pA" inputmode="decimal" placeholder="значение" value="${nf.a === "" ? "" : fmt(nf.a)}">
+      <input class="in" id="pB" inputmode="decimal" placeholder="до" value="${nf.b == null || nf.b === "" ? "" : fmt(nf.b)}"></div>
+      <div class="hint">Условие применяется к сумме по артикулу за выбранный период. Можно писать «1 000 000».</div>`;
+    apply = () => {
+      const op = pop.querySelector("#pOp").value, a = parseNum(pop.querySelector("#pA").value), b = parseNum(pop.querySelector("#pB").value);
+      if (a == null || (op === "between" && b == null)) { delete S.f.num[k]; return; }
+      S.f.num[k] = {op, a, b: op === "between" ? b : null};
+    };
+    clear = () => { delete S.f.num[k]; };
+  } else if (c.type === "dim") {
+    // как в Google Таблицах: по умолчанию отмечено всё; сняли несколько галочек — «все, кроме»,
+    // сняли все и отметили нужные — «только выбранные»
+    let mode = S.f[k].length ? (S.f[k + "_exclude"] ? "ex" : "in") : "all";
+    const sel = new Set(S.f[k]);
+    // как в Excel: при поиске галочки относятся только к найденному (по умолчанию отмечено всё найденное),
+    // «Применить» оставляет в фильтре только отмеченные из найденных; при новом запросе выбор сбрасывается
+    let smode = "all";
+    const ssel = new Set();
+    const isOn = id => {
+      const [m, s] = q ? [smode, ssel] : [mode, sel];
+      return m === "all" ? true : m === "in" ? s.has(id) : !s.has(id);
+    };
+    html += `<input class="in" id="pQ" placeholder="Поиск…" autocomplete="off">
+      <div class="row hint" id="pCnt"></div>
+      <div class="list" id="pList"><div class="hint" style="padding:8px">загрузка…</div></div>
+      <label class="row hint" id="pAddRow" style="display:none"><input type="checkbox" id="pAdd"> добавить отмеченные к текущему выбору</label>`;
+    let shown = [], total = 0, q = "";
+    const summary = () => q
+      ? (smode === "all" ? "Отмечены все найденные" : smode === "in" ? `Отмечено найденных: ${fmt(ssel.size)}` : `Отмечены все найденные, кроме ${fmt(ssel.size)}`)
+      : (mode === "all" ? "Выбраны все" : mode === "in" ? `Выбрано: ${fmt(sel.size)}` : `Выбраны все, кроме ${fmt(sel.size)}`);
+    const setOne = (id, on) => {
+      if (q) {
+        if (smode === "all") { if (!on) { smode = "ex"; ssel.clear(); ssel.add(id); } return; }
+        if ((smode === "in") === on) ssel.add(id); else ssel.delete(id);
+        if (smode === "ex" && ssel.size === 0) smode = "all";
+        return;
+      }
+      if (mode === "all") { if (!on) { mode = "ex"; sel.clear(); sel.add(id); } return; }
+      if ((mode === "in") === on) sel.add(id); else sel.delete(id);
+      if (mode === "ex" && sel.size === 0) mode = "all";
+    };
+    const draw = () => {
+      const allOn = shown.length > 0 && shown.every(x => isOn(x.id));
+      pop.querySelector("#pList").innerHTML = shown.length
+        ? `<label class="all"><input type="checkbox" id="pAllBox" ${allOn ? "checked" : ""}><span class="nm">Выбрать все${q ? ` найденные (${fmt(total)})` : ""}</span><span></span></label>` +
+          shown.map(x => `<label><input type="checkbox" value="${x.id}" ${isOn(x.id) ? "checked" : ""}><span class="nm" title="${esc(x.name)}">${esc(x.name)}${x.platform ? ` <span class="rv">${esc(x.platform)}</span>` : ""}</span><span class="rv">${fmtBig(x.revenue)}</span></label>`).join("")
+        : `<div class="hint" style="padding:8px">ничего не найдено</div>`;
+      pop.querySelector("#pCnt").textContent = `${summary()}. Найдено: ${fmt(total)}${total > shown.length ? `, показаны первые ${shown.length} по выручке` : ""} (за период, с учётом остальных фильтров)`;
+      // «добавить к выбору» имеет смысл, только если фильтр по полю уже задан
+      pop.querySelector("#pAddRow").style.display = !q || mode === "all" ? "none" : "";
+      pop.querySelectorAll("#pList input[value]").forEach(i => i.onchange = () => {
+        const x = shown.find(z => z.id === +i.value);
+        S.names[k][x.id] = x.name; setOne(x.id, i.checked); draw();
+      });
+      const ab = pop.querySelector("#pAllBox");
+      if (ab) ab.onchange = () => selectAll(ab.checked);
+    };
+    const selectAll = on => {
+      if (q) { smode = on ? "all" : "in"; ssel.clear(); }
+      else { mode = on ? "all" : "in"; sel.clear(); }
+      draw();
+    };
+    let qt = null, qseq = 0;
+    const load = async () => {
+      const my = ++qseq;
+      const nq = pop.querySelector("#pQ").value.trim();
+      // список — с учётом периода и всех остальных фильтров (кроме этого же поля)
+      const r = await (await api("/api/values", {field: k, filters: S.f, q: nq, limit: 200, ids: [...sel].slice(0, 300)})).json();
+      if (my !== qseq || !pop) return;
+      if (nq !== q) { q = nq; smode = "all"; ssel.clear(); }
+      const seen = new Set();
+      shown = [];
+      for (const x of [...(q ? [] : r.selected), ...r.items]) if (!seen.has(x.id)) { seen.add(x.id); shown.push(x); }
+      total = r.total;
+      draw();
+    };
+    after = () => {
+      pop.querySelector("#pQ").oninput = () => { clearTimeout(qt); qt = setTimeout(load, 250); };
+      pop.querySelector("#pQ").focus();
+      load();
+    };
+    apply = async () => {
+      // нажали «Применить», не дождавшись поиска по последнему введённому тексту
+      if (pop.querySelector("#pQ").value.trim() !== q) { clearTimeout(qt); await load(); }
+      if (!q) {
+        if (mode === "in" && !sel.size) { pop.querySelector("#pCnt").textContent = "Отметьте хотя бы одно значение"; return false; }
+        S.f[k] = mode === "all" ? [] : [...sel];
+        S.f[k + "_exclude"] = mode === "ex";
+        return;
+      }
+      let ids;
+      if (smode === "in") ids = [...ssel];
+      else {
+        // отмечены все найденные (кроме снятых) — нужны все найденные, а не только показанные первые 200
+        let found = shown;
+        if (total > shown.length) found = (await (await api("/api/values", {field: k, filters: S.f, q, all_ids: true})).json()).items;
+        found.forEach(x => { S.names[k][x.id] = x.name; });
+        ids = found.map(x => x.id).filter(id => !ssel.has(id));
+      }
+      if (!ids.length) { pop.querySelector("#pCnt").textContent = "Отметьте хотя бы одно значение"; return false; }
+      if (pop.querySelector("#pAdd").checked && mode === "in") ids = [...new Set([...sel, ...ids])];
+      else if (pop.querySelector("#pAdd").checked && mode === "ex") {
+        // «все, кроме …» + отмеченные найденные — убираем их из исключений
+        const add = new Set(ids), rest = [...sel].filter(id => !add.has(id));
+        S.f[k] = rest; S.f[k + "_exclude"] = rest.length > 0;
+        return;
+      }
+      S.f[k] = ids;
+      S.f[k + "_exclude"] = false;
+    };
+    clear = () => { S.f[k] = []; S.f[k + "_exclude"] = false; };
+  } else if (k === "name") {
+    const nf = S.f.name || {op: "contains", value: ""};
+    html += `<div class="row"><select id="pOp"><option value="contains" ${nf.op === "contains" ? "selected" : ""}>содержит</option><option value="not_contains" ${nf.op === "not_contains" ? "selected" : ""}>не содержит</option></select></div>
+      <input class="in" id="pV" placeholder="текст" value="${esc(nf.value)}">`;
+    apply = () => { const v = pop.querySelector("#pV").value.trim(); S.f.name = v ? {op: pop.querySelector("#pOp").value, value: v} : null; };
+    clear = () => { S.f.name = null; };
+  } else if (k === "sku") {
+    html += `<textarea id="pV" placeholder="Артикулы через пробел, запятую или с новой строки">${S.f.sku.join("\n")}</textarea>`;
+    apply = () => { S.f.sku = (pop.querySelector("#pV").value.match(/\d+/g) || []).map(Number).slice(0, 10000); };
+    clear = () => { S.f.sku = []; };
+  } else if (k === "platform" || k === "segment") {
+    const list = k === "platform" ? META.platforms : META.segments;
+    const on = id => S.f[k].length === 0 || S.f[k].includes(id);
+    html += `<div class="list"><label class="all"><input type="checkbox" id="pAllBox"><span class="nm">Выбрать все</span><span></span></label>` +
+      list.map(x => `<label><input type="checkbox" value="${x.id}" ${on(x.id) ? "checked" : ""}><span class="nm">${esc(x.name)}</span><span class="rv" data-rv="${x.id}"></span></label>`).join("") +
+      `</div><div class="hint" id="pCnt">выручка за период, с учётом остальных фильтров</div>`;
+    const boxes = () => [...pop.querySelectorAll(".list input[value]")];
+    after = () => {
+      const ab = pop.querySelector("#pAllBox");
+      const sync = () => { ab.checked = boxes().every(b => b.checked); };
+      ab.onchange = () => { boxes().forEach(b => b.checked = ab.checked); };
+      boxes().forEach(b => b.onchange = sync);
+      sync();
+      const p = pop;
+      api("/api/values", {field: k, filters: S.f}).then(r => r.json()).then(r => {
+        if (pop !== p) return;
+        const rv = new Map(r.items.map(x => [x.id, x.revenue]));
+        p.querySelectorAll("[data-rv]").forEach(s => { const v = rv.get(+s.dataset.rv); s.textContent = v ? fmtBig(v) : "—"; });
+      }).catch(() => {});
+    };
+    apply = () => {
+      const ids = boxes().filter(b => b.checked).map(b => +b.value);
+      if (!ids.length) { pop.querySelector("#pCnt").textContent = "Отметьте хотя бы одно значение"; return false; }
+      S.f[k] = ids.length === list.length ? [] : ids;
+    };
+    clear = () => { S.f[k] = []; };
+  } else if (k === "anomaly") {
+    html += `<label class="chip ${S.f.exclude_anomaly ? "on" : ""}"><input type="checkbox" id="pV" ${S.f.exclude_anomaly ? "checked" : ""}> без аномальных периодов</label>
+      <div class="hint">Аномальные периоды — сбои или неполные данные MPSTATS.</div>`;
+    apply = () => { S.f.exclude_anomaly = pop.querySelector("#pV").checked; };
+    clear = () => { S.f.exclude_anomaly = false; };
+  } else {
+    html += `<div class="hint">Для этого столбца доступна только сортировка. Период задаётся датами вверху страницы.</div>`;
+  }
+  if (apply) html += `<div class="actions"><button class="btn" id="pClear">Очистить</button><button class="btn primary" id="pOk">Применить</button></div>`;
+  pop.innerHTML = html;
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  const w = pop.offsetWidth;
+  const want = opts.top ? r.left : r.right - w;
+  pop.style.left = Math.max(8, Math.min(window.scrollX + want, window.scrollX + document.documentElement.clientWidth - w - 8)) + "px";
+  pop.style.top = (window.scrollY + r.bottom + 6) + "px";
+  if (after) after();
+  pop.querySelectorAll("[data-s]").forEach(b => b.onclick = () => { S.sort = k; S.desc = b.dataset.s === "desc"; S.page = 1; closePop(); refresh("rows"); });
+  if (apply) {
+    pop.querySelector("#pOk").onclick = async () => { if (await apply() === false) return; closePop(); S.page = 1; refresh(); };
+    pop.querySelector("#pClear").onclick = () => { clear(); closePop(); S.page = 1; refresh(); };
+    pop.querySelectorAll("input.in").forEach(i => i.addEventListener("keydown", e => { if (e.key === "Enter" && i.id !== "pQ") pop.querySelector("#pOk").click(); }));
+  }
+}
+
+// ---------------------------------------------------------------- выгрузка
+async function exportFile(format) {
+  const btn = format === "xlsx" ? $("expXlsx") : $("expCsv");
+  if (format === "xlsx" && TOTAL > META.excel_max_rows &&
+      !confirm(`Строк ${fmt(TOTAL)} — больше лимита Excel. В файл попадут первые ${fmt(META.excel_max_rows)} по текущей сортировке. Полностью — через CSV. Продолжить?`)) return;
+  btn.disabled = true;
+  const t0 = performance.now();
+  const timer = setInterval(() => status(`Готовлю файл… ${((performance.now() - t0) / 1000).toFixed(0)} с`), 500);
+  try {
+    const r = await api("/api/export", {filters: S.f, sort: S.sort, desc: S.desc, format});
+    const blob = await r.blob();
+    const name = (r.headers.get("Content-Disposition") || "").match(/filename="(.+)"/)?.[1] || `mpstats.${format}`;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    status("");
+  } catch (e) { status("Ошибка выгрузки: " + e.message, true); }
+  finally { clearInterval(timer); btn.disabled = false; }
+}
+$("expXlsx").onclick = () => exportFile("xlsx");
+$("expCsv").onclick = () => exportFile("csv");
+
+// ---------------------------------------------------------------- старт
+(async () => {
+  try {
+    META = await (await api("/api/meta")).json();
+    META.columns.forEach(c => COLS[c.key] = c);
+    $("meta").textContent = `данные ${fmtDate(META.min_dt)} — ${fmtDate(META.max_dt)} · ${fmt(META.rows)} дневных строк · обновлено ${new Date(META.built_at).toLocaleString("ru-RU")}`;
+    S = loadHash();
+    refresh();
+  } catch (e) { status("Ошибка: " + e.message, true); }
+})();
+</script>
+</body>
+</html>
