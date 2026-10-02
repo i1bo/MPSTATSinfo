@@ -31,6 +31,7 @@
     </div>
     <div class="fgroup" id="topFilters"></div>
     <label class="chip" id="anomalyChip"><input type="checkbox" id="exclAnomaly"> без аномальных периодов</label>
+    <label class="chip" id="outlierChip" title="Не учитывать дни товара с неправдоподобной ценой или числом заказов (цена-заглушка, сброс фиктивного остатка)" hidden><input type="checkbox" id="exclOutlier"> без выбросов</label>
     <button class="btn" id="reset">Сбросить фильтры</button>
     <div class="active-filters" id="active" style="flex-basis:100%"></div>
   </section>
@@ -82,7 +83,7 @@ const defaultSegments = () => META.segments.some(x => x.default_off) ? META.segm
 function defaultState() {
   const d2 = META.max_dt, d1 = shiftDays(d2, -89);
   return {f: {d1, d2, platform: [], segment: defaultSegments(), category: [], category_exclude: false, brand: [], brand_exclude: false,
-              seller: [], seller_exclude: false, exclude_anomaly: true, sku: [], name: null, num: {}},
+              seller: [], seller_exclude: false, exclude_anomaly: true, exclude_outlier: true, sku: [], name: null, num: {}},
           sort: "revenue", desc: true, page: 1, page_size: 100, grain: "auto", names: {brand: {}, seller: {}, category: {}}};
 }
 
@@ -148,6 +149,9 @@ function renderControls() {
   $("d1").min = $("d2").min = META.min_dt; $("d1").max = $("d2").max = META.max_dt;
   $("exclAnomaly").checked = S.f.exclude_anomaly;
   $("anomalyChip").classList.toggle("on", S.f.exclude_anomaly);
+  $("exclOutlier").checked = S.f.exclude_outlier;
+  $("outlierChip").classList.toggle("on", S.f.exclude_outlier);
+  $("outlierChip").hidden = !META.has_outliers;
   $("grain").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.g === S.grain));
   $("topFilters").innerHTML = TOP_FILTERS.map(([k, title]) => {
     const v = filterValue(k);
@@ -190,6 +194,7 @@ $("preset").addEventListener("change", () => {
   $("preset").value = ""; S.page = 1; refresh();
 });
 $("exclAnomaly").addEventListener("change", () => { S.f.exclude_anomaly = $("exclAnomaly").checked; S.page = 1; refresh(); });
+$("exclOutlier").addEventListener("change", () => { S.f.exclude_outlier = $("exclOutlier").checked; S.page = 1; refresh(); });
 $("reset").addEventListener("click", () => { const keep = {d1: S.f.d1, d2: S.f.d2}, grain = S.grain; S = defaultState(); Object.assign(S.f, keep); S.grain = grain; refresh(); });
 $("grain").querySelectorAll("button").forEach(b => b.onclick = () => { if (S.grain !== b.dataset.g) { S.grain = b.dataset.g; refresh("chart"); } });
 
@@ -259,6 +264,7 @@ function colActive(k) {
   if (k === "sku") return S.f.sku.length > 0;
   if (k === "name") return !!S.f.name;
   if (k === "anomaly") return S.f.exclude_anomaly;
+  if (k === "outlier") return S.f.exclude_outlier;
   return !!S.f.num[k];
 }
 function renderTable(res) {
@@ -480,6 +486,11 @@ function openFilter(k, anchor, opts = {}) {
       <div class="hint">Аномальные периоды — сбои или неполные данные MPSTATS.</div>`;
     apply = () => { S.f.exclude_anomaly = pop.querySelector("#pV").checked; };
     clear = () => { S.f.exclude_anomaly = false; };
+  } else if (k === "outlier") {
+    html += `<label class="chip ${S.f.exclude_outlier ? "on" : ""}"><input type="checkbox" id="pV" ${S.f.exclude_outlier ? "checked" : ""}> без выбросов</label>
+      <div class="hint">Выбросы — отдельные дни товара с неправдоподобной ценой или числом заказов: цена в 20+ раз выше соседних дней, цена в 10+ раз выше почти всех цен категории, средний чек в 10+ раз выше обычного для товара, заказы в 50+ раз выше обычных. Подробности — на странице артикула.</div>`;
+    apply = () => { S.f.exclude_outlier = pop.querySelector("#pV").checked; };
+    clear = () => { S.f.exclude_outlier = false; };
   } else {
     html += `<div class="hint">Для этого столбца доступна только сортировка. Период задаётся датами вверху страницы.</div>`;
   }

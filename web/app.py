@@ -48,6 +48,7 @@ load_env()
 DB_PATH = Path(os.environ.get("DUCKDB_PATH", BASE / "data" / "mpstats.duckdb"))
 CACHE_ROWS = int(os.environ.get("WEB_CACHE_ROWS", 30_000_000))
 HAS_MONTHLY = False
+HAS_OUTLIERS = False  # файл собран с выбросами (sales.outlier, таблица outliers)
 EXCEL_MAX_ROWS = 1_048_575  # лимит листа Excel минус строка заголовка
 ESTIMATED_FROM = "2025-09-01"  # WB с этой даты отдаёт оценочные выручку и заказы
 OTHER_SEGMENT = "Прочее"       # случайно попавшие категории (см. categories.py), по умолчанию выключен в фильтре
@@ -69,6 +70,7 @@ COLUMNS = {
     "first_dt":   ("Первая продажа",       "date",   "first_dt"),
     "last_dt":    ("Последняя продажа",    "date",   "last_dt"),
     "anomaly":    ("Аномальный период",    "bool",   "anomaly"),
+    "outlier":    ("Есть выбросы",         "bool",   "outlier"),
 }
 NUM_COLS = [k for k, v in COLUMNS.items() if v[1] == "num"]
 
@@ -108,6 +110,7 @@ class Filters(BaseModel):
     seller: list[int] = []
     seller_exclude: bool = False
     exclude_anomaly: bool = False
+    exclude_outlier: bool = False
     sku: list[int] = []
     name: TextFilter | None = None
     num: dict[str, NumFilter] = {}
@@ -146,6 +149,8 @@ def where_rows(f: Filters, d1, d2):
         cond.append(f"s.seller_id {'NOT IN' if f.seller_exclude else 'IN'} ({ids(f.seller)})")
     if f.exclude_anomaly:
         cond.append("NOT s.anomaly")
+    if f.exclude_outlier and HAS_OUTLIERS:
+        cond.append("NOT s.outlier")
     if f.sku:
         cond.append(f"s.sku IN ({ids(f.sku)})")
     if f.name and f.name.value.strip():
@@ -157,9 +162,9 @@ def where_rows(f: Filters, d1, d2):
 
 
 DAILY_COLS = ("s.dt, s.platform, s.sku, s.category_id, s.brand_id, s.seller_id, s.revenue, s.orders, "
-              "1 AS days, s.dt AS first_dt, s.dt AS last_dt, s.anomaly")
+              "1 AS days, s.dt AS first_dt, s.dt AS last_dt, s.anomaly, {outlier}")
 MONTHLY_COLS = ("s.dt, s.platform, s.sku, s.category_id, s.brand_id, s.seller_id, s.revenue, s.orders, "
-                "s.days, s.first_dt, s.last_dt, s.anomaly")
+                "s.days, s.first_dt, s.last_dt, s.anomaly, {outlier}")
 
 
 def month_add(d: dt.date, n: int) -> dt.date:
@@ -176,6 +181,7 @@ def source(f: Filters, daily_only=False):
 
     def add(table, cols, d1, d2):
         w, p = where_rows(f, d1, d2)
+        cols = cols.format(outlier="s.outlier" if HAS_OUTLIERS else "false AS outlier")
         parts.append(f"SELECT {cols} FROM d.{table} s WHERE {w}")
         params.extend(p)
 
@@ -242,9 +248,10 @@ class Store:
             except OSError:
                 pass  # файл занят другим запущенным процессом сайта
         con.execute(f"ATTACH '{cache_file.as_posix()}' AS cache")
-        global HAS_MONTHLY  # файл, собранный старой версией build_duckdb.py, может быть без sales_m
-        HAS_MONTHLY = con.execute("SELECT count(*) FROM duckdb_tables() "
-                                  "WHERE database_name = 'd' AND table_name = 'sales_m'").fetchone()[0] > 0
+        global HAS_MONTHLY, HAS_OUTLIERS  # файл, собранный старой версией build_duckdb.py, может быть без них
+        tables = {r[0] for r in con.execute("SELECT table_name FROM duckdb_tables() WHERE database_name = 'd'").fetchall()}
+        HAS_MONTHLY = "sales_m" in tables
+        HAS_OUTLIERS = "outliers" in tables
         old = self.con
         self.con, self.mtime, self.cache = con, self.path.stat().st_mtime, collections.OrderedDict()
         if old is not None:
@@ -288,7 +295,8 @@ class Store:
                                max(s.category_id)          AS category_id,
                                any_value(s.brand_id)       AS brand_id,
                                any_value(s.seller_id)      AS seller_id,
-                               bool_or(s.anomaly)          AS anomaly
+                               bool_or(s.anomaly)          AS anomaly,
+                               bool_or(s.outlier)          AS outlier
                         FROM {src} s
                         GROUP BY ALL
                     )
@@ -473,10 +481,12 @@ def sku_info(platform: int, sku: int):
         LEFT JOIN d.brands b USING (brand_id) LEFT JOIN d.sellers s USING (seller_id)
         WHERE p.platform = ? AND p.sku = ?
     """, [platform, sku]).fetchone()
-    days = cur.execute("""
-        SELECT s.dt, s.revenue, s.orders, s.price, s.anomaly, c.display, g.name, c.group_id, g.segment_id
+    out = ("o.rule, o.ratio, o.ref", "LEFT JOIN d.outliers o ON o.platform = s.platform AND o.sku = s.sku AND o.dt = s.dt")         if HAS_OUTLIERS else ("NULL, NULL, NULL", "")
+    days = cur.execute(f"""
+        SELECT s.dt, s.revenue, s.orders, s.price, s.anomaly, c.display, g.name, c.group_id, g.segment_id, {out[0]}
         FROM d.sales s
         LEFT JOIN d.categories c USING (category_id) LEFT JOIN d.segments g ON g.segment_id = c.site_segment_id
+        {out[1]}
         WHERE s.platform = ? AND s.sku = ? ORDER BY s.dt
     """, [platform, sku]).fetchall()
     if not card and not days:
@@ -489,7 +499,8 @@ def sku_info(platform: int, sku: int):
         "name": card[0] if card else None, "brand": card[1] if card else None, "seller": card[2] if card else None,
         "brand_id": card[3] if card else None, "seller_id": card[4] if card else None,
         "categories": cats, "segments": segs, "estimated_from": ESTIMATED_FROM,
-        "days": [[d[0].isoformat(), d[1], d[2], d[3], d[4]] for d in days],
+        # [дата, выручка, заказы, цена, аномалия, выброс: null или [правило, во сколько раз, с чем сравнивали]]
+        "days": [[d[0].isoformat(), d[1], d[2], d[3], d[4], [d[9], d[10], d[11]] if d[9] else None] for d in days],
         "seconds": round(time.time() - t, 2),
     }
 
@@ -502,7 +513,7 @@ def meta():
                            [OTHER_SEGMENT]).fetchall()
     return {
         "built_at": built_at.isoformat(), "min_dt": min_dt.isoformat(), "max_dt": max_dt.isoformat(),
-        "rows": rows, "estimated_from": ESTIMATED_FROM, "excel_max_rows": EXCEL_MAX_ROWS,
+        "rows": rows, "estimated_from": ESTIMATED_FROM, "excel_max_rows": EXCEL_MAX_ROWS, "has_outliers": HAS_OUTLIERS,
         "platforms": [{"id": 1, "name": "Wildberries"}, {"id": 2, "name": "Ozon"}],
         "segments": [{"id": i, "name": n, "default_off": n == OTHER_SEGMENT} for i, n in segments],
         "columns": [{"key": k, "label": v[0], "type": v[1]} for k, v in COLUMNS.items()],
@@ -648,14 +659,14 @@ def summary(f: Filters, grain: Literal["auto", "day", "week", "month"] = "auto")
     r = cur.execute(f"""
         SELECT count(*), sum(revenue), sum(orders), count(DISTINCT (platform, sku)),
                count(DISTINCT brand_id), count(DISTINCT seller_id), avg(revenue),
-               bool_or(platform = 1 AND last_dt >= DATE '{ESTIMATED_FROM}'), bool_or(anomaly)
+               bool_or(platform = 1 AND last_dt >= DATE '{ESTIMATED_FROM}'), bool_or(anomaly), bool_or(outlier)
         FROM cache.main.{name}
     """).fetchone()
     totals = {
         "rows": r[0], "revenue": int(r[1] or 0), "orders": int(r[2] or 0), "products": r[3],
         "brands": r[4], "sellers": r[5], "avg_revenue": round(r[6] or 0),
         "avg_check": round((r[1] or 0) / r[2]) if r[2] else None,
-        "has_estimated": bool(r[7]), "has_anomaly": bool(r[8]),
+        "has_estimated": bool(r[7]), "has_anomaly": bool(r[8]), "has_outlier": bool(r[9]),
     }
 
     # динамика: по строкам тех артикулов, что прошли фильтр

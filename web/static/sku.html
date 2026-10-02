@@ -37,7 +37,9 @@
         <button type="button" data-g="day">по дням</button><button type="button" data-g="week">по неделям</button><button type="button" data-g="month">по месяцам</button>
       </span>
     </div>
+    <label class="chip" id="outlierChip" title="Не учитывать дни с неправдоподобной ценой или числом заказов" hidden><input type="checkbox" id="exclOutlier"> без выбросов</label>
   </section>
+  <section class="notice" id="outNotice" hidden></section>
 
   <section class="kpis" id="kpis"></section>
   <section class="card chart-card">
@@ -60,15 +62,25 @@
 "use strict";
 const [, , PLATFORM, SKU] = location.pathname.split("/").map(decodeURIComponent);
 let META = null, INFO = null, chart = null;
-const S = {d1: null, d2: null, grain: "day", sort: "t", desc: false};
+const S = {d1: null, d2: null, grain: "day", sort: "t", desc: false, out: true};  // out — не учитывать выбросы
 
 // ---------------------------------------------------------------- состояние в адресе: #d1=…&d2=…&grain=…
 function loadHash() {
   const h = new URLSearchParams(location.hash.slice(1));
   for (const k of ["d1", "d2", "grain"]) if (h.get(k)) S[k] = h.get(k);
+  S.out = h.get("out") !== "0";
   if (!["day", "week", "month"].includes(S.grain)) S.grain = "day";
 }
-function saveHash() { history.replaceState(null, "", `#d1=${S.d1}&d2=${S.d2}&grain=${S.grain}`); }
+function saveHash() { history.replaceState(null, "", `#d1=${S.d1}&d2=${S.d2}&grain=${S.grain}${S.out ? "" : "&out=0"}`); }
+
+// выброс дня: [правило, во сколько раз выше, с чем сравнивали] — см. mark_outliers в web/build_duckdb.py
+function outlierReason([rule, ratio, ref]) {
+  const k = fmt(Math.round(ratio)) + "×";
+  if (rule === 1) return `цена в ${k} выше, чем в соседние дни продаж (${fmt(ref)} ₽)`;
+  if (rule === 2) return `цена в ${k} выше, чем у 99% продаж категории за год (до ${fmt(ref)} ₽)`;
+  if (rule === 3) return `заказов в ${k} больше обычного для товара (обычно ${fmt(ref)} в день)`;
+  return `средний чек в ${k} выше обычного для товара (обычно ${fmt(ref)} ₽)`;
+}
 
 // ---------------------------------------------------------------- расчёт по дневным строкам (всё в браузере)
 function weekStart(iso) {
@@ -82,13 +94,16 @@ function nextBucket(iso, g) {
   return shiftDays(iso, g === "week" ? 7 : 1);
 }
 function aggregate() {
-  const days = INFO.days.filter(d => d[0] >= S.d1 && d[0] <= S.d2);  // [dt, revenue, orders, price, anomaly]
+  const inPeriod = INFO.days.filter(d => d[0] >= S.d1 && d[0] <= S.d2);  // [dt, revenue, orders, price, anomaly, outlier]
+  const outliers = inPeriod.filter(d => d[5]);
+  const days = S.out ? inPeriod.filter(d => !d[5]) : inPeriod;
   const map = new Map();
-  for (const [dt, rev, ord, price, anom] of days) {
+  for (const [dt, rev, ord, price, anom, outl] of days) {
     const b = bucket(dt, S.grain);
     let r = map.get(b);
-    if (!r) map.set(b, r = {t: b, revenue: 0, orders: 0, days: 0, priceSum: 0, priceN: 0, anomaly: false});
+    if (!r) map.set(b, r = {t: b, revenue: 0, orders: 0, days: 0, priceSum: 0, priceN: 0, anomaly: false, outliers: []});
     r.revenue += rev; r.orders += ord || 0; r.days += 1; r.anomaly = r.anomaly || anom;
+    if (outl) r.outliers.push(`${fmtDate(dt)}: ${outlierReason(outl)}`);
     if (price != null) { r.priceSum += price; r.priceN += 1; }
   }
   const rows = [...map.values()].map(r => ({...r, avg_check: r.orders ? Math.round(r.revenue / r.orders) : null,
@@ -102,7 +117,21 @@ function aggregate() {
                     : {t: b, revenue: 0, orders: 0, avg_check: null});
     }
   }
-  return {days, rows, points};
+  return {days, rows, points, outliers};
+}
+
+function renderOutliers(outliers) {
+  const box = $("outNotice");
+  box.hidden = !outliers.length;
+  if (!outliers.length) return;
+  const rev = outliers.reduce((a, d) => a + d[1], 0), MAX = 10;
+  const n = outliers.length, word = n % 10 === 1 && n % 100 !== 11 ? "день" : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? "дня" : "дней";
+  box.innerHTML = `<span class="t">Выбросы: ${fmt(n)} ${word}, выручка ${fmtBig(rev, "₽")}</span> — ${S.out
+      ? "не учтены в цифрах, графике и таблице (снимите «без выбросов», чтобы учесть)"
+      : "учтены, в таблице выделены цветом"}
+    <ul>${outliers.slice(0, MAX).map(([dt, r, o, price, , outl]) =>
+      `<li>${fmtDate(dt)}: ${fmt(o)} шт по ${fmt(price)} ₽ = ${fmt(r)} ₽ — ${esc(outlierReason(outl))}</li>`).join("")}${
+      n > MAX ? `<li>и ещё ${fmt(n - MAX)}</li>` : ""}</ul>`;
 }
 
 // ---------------------------------------------------------------- отрисовка
@@ -144,7 +173,10 @@ function render() {
   updateDrills();
   $("d1").value = S.d1; $("d2").value = S.d2;
   $("grain").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.g === S.grain));
-  const {days, rows, points} = aggregate();
+  $("exclOutlier").checked = S.out;
+  $("outlierChip").classList.toggle("on", S.out);
+  const {days, rows, points, outliers} = aggregate();
+  renderOutliers(outliers);
 
   const rev = days.reduce((a, d) => a + d[1], 0), ord = days.reduce((a, d) => a + (d[2] || 0), 0);
   const prices = days.map(d => d[3]).filter(v => v != null);
@@ -182,8 +214,11 @@ function renderTable(rows) {
     return S.desc ? -r : r;
   });
   $("thead").innerHTML = "<tr>" + cols.map(c => `<th class="sortable ${c.num ? "num" : ""}" data-k="${c.key}" ${c.hint ? `title="${esc(c.hint)}"` : ""}>${esc(c.label)}${S.sort === c.key ? (S.desc ? " ↓" : " ↑") : ""}</th>`).join("") + "</tr>";
-  $("tbody").innerHTML = sorted.map(r => `<tr class="${r.anomaly ? "anom" : ""}" ${r.anomaly ? 'title="аномальный период"' : ""}>` + cols.map(c =>
-    c.key === "t" ? `<td>${periodLabel(r.t, S.grain)}</td>` : `<td class="num">${fmt(r[c.key])}</td>`).join("") + "</tr>").join("")
+  $("tbody").innerHTML = sorted.map(r => {
+    const tips = (r.anomaly ? ["аномальный период"] : []).concat(r.outliers.length ? ["выброс — " + r.outliers.join("; ")] : []);
+    return `<tr class="${r.outliers.length ? "outl" : r.anomaly ? "anom" : ""}" ${tips.length ? `title="${esc(tips.join("; "))}"` : ""}>` + cols.map(c =>
+    c.key === "t" ? `<td>${periodLabel(r.t, S.grain)}</td>` : `<td class="num">${fmt(r[c.key])}</td>`).join("") + "</tr>";
+  }).join("")
     || `<tr><td colspan="${cols.length}" style="color:var(--muted);padding:24px">Нет продаж за выбранный период</td></tr>`;
   $("thead").querySelectorAll("th").forEach(th => th.onclick = () => {
     const k = th.dataset.k;
@@ -216,6 +251,7 @@ $("preset").onchange = () => {
   $("preset").value = ""; render();
 };
 $("grain").querySelectorAll("button").forEach(b => b.onclick = () => { S.grain = b.dataset.g; render(); });
+$("exclOutlier").onchange = () => { S.out = $("exclOutlier").checked; render(); };
 document.addEventListener("themechange", () => { if (chart) chart.draw(); });
 
 (async () => {
@@ -234,6 +270,7 @@ document.addEventListener("themechange", () => { if (chart) chart.draw(); });
       const n = (new Date(S.d2) - new Date(S.d1)) / 864e5;
       S.grain = n <= 92 ? "day" : n <= 400 ? "week" : "month";
     }
+    $("outlierChip").hidden = !INFO.days.some(d => d[5]);  // переключатель — только если у товара есть выбросы
     renderHead();
     render();
     status("");
