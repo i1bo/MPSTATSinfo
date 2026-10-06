@@ -1,10 +1,9 @@
-# Сайт:                docker compose up -d --build
+# Сайт и база:         docker compose up -d --build
 # Пересобрать DuckDB:  docker compose run --rm build-db && docker compose restart web
 # Выгрузка MPSTATS:    docker compose run --rm loader run --platform wb      (любая команда loader.py)
 #
-# Настройки — в .env (см. .env.example). Файл DuckDB лежит в ./data на сервере, в образ не попадает.
-# Postgres в этот файл не входит: PG_DSN в .env должен указывать на существующую базу
-# (Postgres на самом сервере — хост host.docker.internal вместо localhost).
+# Настройки — в .env (см. .env.example). Данные лежат в папках проекта на сервере, в образ не попадают:
+#   ./pgdata — база PostgreSQL, ./data — файл DuckDB для сайта, ./logs — логи.
 
 x-app: &app
   build: .
@@ -15,10 +14,31 @@ x-app: &app
   volumes:
     - ./data:/app/data
     - ./logs:/app/logs
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
 
 services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?задайте PG_PASSWORD в .env}
+      POSTGRES_DB: mpstats
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    # снаружи сервера база не видна; с самого сервера (или через SSH-туннель) — порт 5433
+    ports:
+      - "127.0.0.1:5433:5432"
+    shm_size: 1g
+    # память Postgres рассчитана на сервер 32 ГБ, где есть и другие проекты
+    command: >
+      postgres -c shared_buffers=4GB -c effective_cache_size=12GB -c work_mem=64MB
+               -c maintenance_work_mem=1GB -c max_wal_size=8GB -c checkpoint_timeout=15min
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mpstats"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   web:
     <<: *app
     environment:
@@ -26,6 +46,7 @@ services:
       TMPDIR: /cache          # кэш результатов фильтров и временные файлы выгрузки
     volumes:
       - ./data:/app/data:ro
+      - ./logs:/app/logs
       - cache:/cache
     ports:
       - "${WEB_PORT:-8000}:8000"
@@ -34,11 +55,15 @@ services:
   build-db:
     <<: *app
     profiles: ["tools"]
+    depends_on:
+      db: {condition: service_healthy}
     command: ["python", "web/build_duckdb.py"]
 
   loader:
     <<: *app
     profiles: ["tools"]
+    depends_on:
+      db: {condition: service_healthy}
     entrypoint: ["python", "-u", "loader.py"]
     command: ["status"]
 

@@ -18,16 +18,37 @@ web/app.py             сайт (FastAPI), читает только файл Du
 
 ## Сервер (Docker)
 
+Всё в `docker-compose.yml`: `db` — PostgreSQL 16 (данные в `./pgdata`, снаружи сервера не виден),
+`web` — сайт на порту `WEB_PORT`, `build-db` и `loader` — разовые команды. После перезагрузки сервера
+`db` и `web` поднимаются сами.
+
 Первый запуск:
 
 ```bash
-git clone <адрес репозитория> mpstats && cd mpstats
-cp .env.example .env        # заполнить: WEB_PASSWORD, PG_DSN, MPSTATS_TOKEN
-mkdir -p data               # сюда положить mpstats.duckdb (или собрать, см. ниже)
+git clone <адрес репозитория> ~/mpstats && cd ~/mpstats
+cp .env.example .env        # заполнить: WEB_PASSWORD, PG_PASSWORD, PG_DSN (хост db), MPSTATS_TOKEN
+mkdir -p data logs pgdata
+docker compose up -d db     # пустая база; затем перенести дамп (ниже)
+docker compose run --rm build-db
 docker compose up -d --build
 ```
 
-Сайт — на порту `WEB_PORT` (по умолчанию 8000).
+Перенос базы с Windows-машины. Дамп идёт сразу по сети и на диске не сохраняется. Запускать в cmd,
+не в PowerShell: PowerShell 5 портит двоичные данные в конвейере.
+
+```
+set PGPASSWORD=пароль_локального_postgres
+"%ProgramFiles%\PostgreSQL\16\bin\pg_dump.exe" -h localhost -p 5433 -U postgres -d mpstats -n mpstats -Fc -Z 6 | ssh -p ПОРТ пользователь@сервер "cat > ~/mpstats.dump"
+```
+
+На сервере:
+
+```bash
+cd ~/mpstats
+docker compose cp ~/mpstats.dump db:/tmp/mpstats.dump
+docker compose exec db pg_restore -U postgres -d mpstats --no-owner -j 4 /tmp/mpstats.dump
+docker compose exec db rm /tmp/mpstats.dump && rm ~/mpstats.dump
+```
 
 Обновление кода:
 
@@ -35,14 +56,13 @@ docker compose up -d --build
 git pull && docker compose up -d --build
 ```
 
-Данные. Файл `data/mpstats.duckdb` (~6,5 ГБ) можно скопировать с машины, где он собран, или собрать на сервере из Postgres:
+Пересобрать файл сайта после догрузки данных (~6 мин):
 
 ```bash
 docker compose run --rm build-db && docker compose restart web
 ```
 
 Сборке нужно свободное место: ~2× размер файла плюс временные файлы (сейчас ~15 ГБ).
-Postgres в docker-compose не входит: `PG_DSN` должен указывать на существующую базу. Postgres на том же сервере — хост `host.docker.internal`, и Postgres должен принимать подключения из сети Docker (`listen_addresses`, `pg_hba.conf`).
 
 Выгрузка из MPSTATS в контейнере — любая команда `loader.py`:
 
