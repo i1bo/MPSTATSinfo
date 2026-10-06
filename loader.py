@@ -7,7 +7,9 @@
   python loader.py discover             найти доп. предметы WB из каталога "Бытовая техника"
   python loader.py plan                 заполнить очередь заданий (load_jobs)
   python loader.py test-quota           проверить, списывает ли квоту пагинация
-  python loader.py run [--limit N] [--platform wb|ozon]
+  python loader.py plan-garden          задания сегмента «Сад и дача»
+  python loader.py plan-pets            задания сегмента «Товары для животных» (автокормушки, автопоилки)
+  python loader.py run [--limit N] [--platform wb|ozon] [--segment СЕГМЕНТ]
                                         выполнять задания из очереди (можно прерывать и продолжать)
   python loader.py status               сводка по очереди и базе
   python loader.py progress             таблица прогресса по годам
@@ -90,11 +92,38 @@ OZON_GARDEN_PATHS = [
 OZON_GARDEN_LEGACY = [("Дом и сад/Цветы и растения/Лейки и опрыскиватели", dt.date(2024, 12, 31))]
 
 
+# ---------------------------------------------------------------- сегмент «Товары для животных»
+# Название сегмента сортируется после остальных — id прежних сегментов на сайте (и ссылки с фильтрами) не сдвигаются
+PETS_SEGMENT = "Товары для животных"
+PETS_UNTIL = dt.date(2026, 8, 10)
+# у WB отдельного предмета для автокормушек нет — грузим предметы целиком (решение пользователя)
+WB_PETS_SUBJECTS = [
+    "Товары для животных / Кормушки для животных",
+    "Товары для животных / Поилки для животных",
+]
+OZON_PETS_PATHS = [
+    "Товары для животных/Товары для кошек/Посуда для кошек/Автокормушки и автопоилки для кошек",
+    "Товары для животных/Товары для собак/Посуда для собак/Автокормушки и автопоилки для собак",
+]
+
+# Догружаемые сегменты не перезаписывают дни товара, уже лежащие в другом сегменте
+# (товар мог попасть в выдачу и прежних предметов) — существующие данные сайта не меняются.
+ISOLATED_SEGMENTS = {PETS_SEGMENT}
+
+
 def wb_garden_subjects():
     subs = read_csv(REF / "wb_subjects_all.csv")
     names = set(WB_GARDEN_SUBJECTS)
     return [(int(s["id"]), s["name"], s["first_date"] or "2020-01-01")
             for s in subs if s["parent"] in WB_GARDEN_PARENTS or s["name"] in names]
+
+
+def wb_pets_subjects():
+    subs = {s["name"]: s for s in read_csv(REF / "wb_subjects_all.csv")}
+    missing = [n for n in WB_PETS_SUBJECTS if n not in subs]
+    if missing:
+        sys.exit(f"Нет в справочнике wb_subjects_all.csv: {missing}")
+    return [(int(subs[n]["id"]), n, subs[n]["first_date"] or "2020-01-01") for n in WB_PETS_SUBJECTS]
 
 
 # ---------------------------------------------------------------- настройки
@@ -388,9 +417,20 @@ def category_ids(con, job, names):
 INT_MAX = 2_147_483_647
 
 
+def own_segment(table, segment):
+    """Условие «строка таблицы уже относится к сегменту задания» — для ISOLATED_SEGMENTS, иначе всегда истина."""
+    if segment not in ISOLATED_SEGMENTS:
+        return "TRUE"
+    seg = segment.replace("'", "''")
+    return f"{table}.category_id IN (SELECT category_id FROM mpstats.categories WHERE segment = '{seg}')"
+
+
 def save(con, job, daily, prods):
     pcode = PLATFORM_CODE[job["platform"]]
     cids = category_ids(con, job, {r[2] for r in daily} | {p[5] for p in prods})
+    own_daily = own_segment("sales_daily", job["segment"])
+    own_over = own_segment("sales_daily_overflow", job["segment"])
+    own_prod = own_segment("products", job["segment"])
     # аномальные значения (сбои данных MPSTATS) не влезают в integer — кладём их отдельно
     big = [r for r in daily if any(v is not None and abs(v) > INT_MAX for v in r[3:6])]
     if big:
@@ -399,7 +439,8 @@ def save(con, job, daily, prods):
             """INSERT INTO mpstats.sales_daily_overflow (platform, sku, dt, category_id, revenue, orders, price)
                VALUES (%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (platform, sku, dt) DO UPDATE SET revenue=EXCLUDED.revenue,
-                   orders=EXCLUDED.orders, price=EXCLUDED.price, category_id=EXCLUDED.category_id""",
+                   orders=EXCLUDED.orders, price=EXCLUDED.price, category_id=EXCLUDED.category_id
+               WHERE """ + own_over,
             [(pcode, sku, day, cids[cat], rev, o, p) for sku, day, cat, rev, o, p in big])
         print(f"   аномальных строк (> int): {len(big)} -> sales_daily_overflow")
     with con.transaction():
@@ -411,14 +452,15 @@ def save(con, job, daily, prods):
             for sku, day, cat, rev, o, p in daily:
                 cp.write_row((sku, day, cids[cat], rev, o, p, pcode))
         # один SKU может попасть в несколько предметов/страниц -> берём одну строку
-        con.execute("""
+        con.execute(f"""
             INSERT INTO mpstats.sales_daily (sku, dt, category_id, revenue, orders, price, platform)
             SELECT DISTINCT ON (platform, sku, dt) sku, dt, category_id, revenue, orders, price, platform
             FROM tmp_daily ORDER BY platform, sku, dt
             ON CONFLICT (platform, sku, dt) DO UPDATE SET
                 revenue = EXCLUDED.revenue, orders = EXCLUDED.orders, price = EXCLUDED.price,
-                category_id = EXCLUDED.category_id""")
-        cur.executemany("""
+                category_id = EXCLUDED.category_id
+            WHERE {own_daily}""")
+        cur.executemany(f"""
             INSERT INTO mpstats.products (platform, sku, name, brand, seller, seller_id,
                                           category_id, first_dt, last_dt)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -428,7 +470,7 @@ def save(con, job, daily, prods):
                 seller = CASE WHEN EXCLUDED.last_dt >= products.last_dt
                               THEN COALESCE(EXCLUDED.seller, products.seller) ELSE products.seller END,
                 seller_id = COALESCE(EXCLUDED.seller_id, products.seller_id),
-                category_id = CASE WHEN EXCLUDED.last_dt >= products.last_dt
+                category_id = CASE WHEN EXCLUDED.last_dt >= products.last_dt AND {own_prod}
                                    THEN EXCLUDED.category_id ELSE products.category_id END,
                 first_dt = LEAST(products.first_dt, EXCLUDED.first_dt),
                 last_dt = GREATEST(products.last_dt, EXCLUDED.last_dt),
@@ -447,7 +489,7 @@ def run_job(con, job, page_size, max_pages=None, pause=0.0, quota_each_page=Fals
                 "error=NULL WHERE job_id=%s", (job["job_id"],))
     start, pages = job["next_row"], 0
     while True:
-        free_gb = shutil.disk_usage(cfg("DATA_DISK", "C:\\")).free / 1e9
+        free_gb = shutil.disk_usage(cfg("DATA_DISK", str(BASE))).free / 1e9
         if free_gb < cfg("MIN_FREE_GB", 5.0):
             raise DiskFull(f"на диске осталось {free_gb:.1f} ГБ")
         data, code, secs = post_page(url, payload_for(job["metric"], start, page_size))
@@ -499,12 +541,15 @@ def fetch_jobs(con, platform=None, limit=None, job_id=None):
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def claim_job(con, platform=None, job_id=None):
+def claim_job(con, platform=None, job_id=None, segment=None):
     """Атомарно забирает следующее задание — безопасно при нескольких параллельных воркерах."""
     cond, params = "status = 'new'", []
     if platform:
         cond += " AND platform = %s"
         params.append(platform)
+    if segment:
+        cond += " AND segment = %s"
+        params.append(segment)
     if job_id:
         cond += " AND job_id = %s"
         params.append(job_id)
@@ -565,12 +610,12 @@ def cmd_run(args):
     with pg() as con:
         n = 0
         while not args.limit or n < args.limit:
-            job = claim_job(con, args.platform, args.job)
+            job = claim_job(con, args.platform, args.job, args.segment)
             if not job:
                 print(f"{tag} очередь пуста")
                 return
             n += 1
-            free_gb = shutil.disk_usage(cfg("DATA_DISK", "C:\\")).free / 1e9
+            free_gb = shutil.disk_usage(cfg("DATA_DISK", str(BASE))).free / 1e9
             if free_gb < cfg("MIN_FREE_GB", 5.0):
                 con.execute("UPDATE mpstats.load_jobs SET status='new' WHERE job_id=%s", (job["job_id"],))
                 print(f"{tag} на диске осталось {free_gb:.1f} ГБ — останавливаюсь")
@@ -617,37 +662,46 @@ def cmd_test_quota(args):
                     "daily_rows=0 WHERE job_id=%s", (job["job_id"],))
 
 
-def cmd_plan_garden(_):
-    """Задания сегмента «Сад и дача» (2020 — GARDEN_UNTIL). Предметы WB, уже загруженные в
-    другом сегменте, не перегружаются — им только меняется сегмент в справочнике."""
-    subjects = wb_garden_subjects()
+def plan_segment(segment, until, subjects, ozon_paths, ozon_legacy=()):
+    """Задания сегмента за 2020 — until. Предметы WB, уже загруженные в другом сегменте, не перегружаются —
+    им только меняется сегмент в справочнике. Повторный запуск безопасен: задания уникальны по (площадка, путь, период)."""
     with pg() as con:
         loaded = {int(r[0]) for r in con.execute(
-            "SELECT DISTINCT path FROM mpstats.load_jobs WHERE platform='wb'")}
+            "SELECT DISTINCT path FROM mpstats.load_jobs WHERE platform='wb' AND segment <> %s", (segment,))}
         moved = [sid for sid, _, _ in subjects if sid in loaded]
         if moved:
             con.execute("UPDATE mpstats.categories SET segment=%s WHERE platform=1 AND subject_id = ANY(%s)",
-                        (GARDEN_SEGMENT, moved))
+                        (segment, moved))
         jobs = []
         for sid, name, first in subjects:
             if sid in loaded:
                 continue
-            for d1, d2 in periods(GARDEN_UNTIL):
+            for d1, d2 in periods(until):
                 if d2 >= dt.date.fromisoformat(first):
                     metric = "revenue_estimated" if d1 >= WB_ESTIMATED_FROM else "revenue"
-                    jobs.append(("wb", GARDEN_SEGMENT, str(sid), name, d1, d2, metric))
-        for path in OZON_GARDEN_PATHS:
-            for d1, d2 in periods(GARDEN_UNTIL):
-                jobs.append(("ozon", GARDEN_SEGMENT, path, path, d1, d2, "revenue"))
-        for path, until in OZON_GARDEN_LEGACY:
-            for d1, d2 in periods(GARDEN_UNTIL):
-                if d2 <= until:
-                    jobs.append(("ozon", GARDEN_SEGMENT, path, path, d1, d2, "revenue"))
+                    jobs.append(("wb", segment, str(sid), name, d1, d2, metric))
+        for path in ozon_paths:
+            for d1, d2 in periods(until):
+                jobs.append(("ozon", segment, path, path, d1, d2, "revenue"))
+        for path, legacy_until in ozon_legacy:
+            for d1, d2 in periods(until):
+                if d2 <= legacy_until:
+                    jobs.append(("ozon", segment, path, path, d1, d2, "revenue"))
         con.cursor().executemany(
             """INSERT INTO mpstats.load_jobs (platform, segment, path, path_name, d1, d2, metric)
                VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (platform, path, d1, d2) DO NOTHING""", jobs)
-    print(f"Предметов WB: {len(subjects)} (уже загружены ранее, перенесены в сегмент: {len(moved)}); "
-          f"заданий добавлено: {len(jobs)}")
+        new = con.execute("SELECT platform, count(*) FROM mpstats.load_jobs WHERE segment=%s AND status='new' "
+                          "GROUP BY 1", (segment,)).fetchall()
+    print(f"«{segment}»: предметов WB {len(subjects)} (уже загружены ранее, перенесены в сегмент: {len(moved)}), "
+          f"путей Ozon {len(ozon_paths)}; заданий {len(jobs)}, ждут выгрузки: {dict(new)}")
+
+
+def cmd_plan_garden(_):
+    plan_segment(GARDEN_SEGMENT, GARDEN_UNTIL, wb_garden_subjects(), OZON_GARDEN_PATHS, OZON_GARDEN_LEGACY)
+
+
+def cmd_plan_pets(_):
+    plan_segment(PETS_SEGMENT, PETS_UNTIL, wb_pets_subjects(), OZON_PETS_PATHS)
 
 
 def cmd_status(_):
@@ -677,6 +731,7 @@ def main():
     p.add_argument("--platform", choices=["wb", "ozon"])
     p.add_argument("--limit", type=int)
     p.add_argument("--job", type=int)
+    p.add_argument("--segment", help="только задания этого сегмента, напр. \"Товары для животных\"")
     p = sp.add_parser("test-quota")
     p.add_argument("--job", type=int)
     p.add_argument("--page-size", type=int, default=200)
@@ -685,12 +740,13 @@ def main():
     sp.add_parser("requeue")
     sp.add_parser("progress")
     sp.add_parser("plan-garden")
+    sp.add_parser("plan-pets")
     args = ap.parse_args()
     load_env()
     {"init-db": cmd_init_db, "quota": cmd_quota, "discover": cmd_discover, "plan": cmd_plan,
      "run": cmd_run, "test-quota": cmd_test_quota, "status": cmd_status,
      "requeue": cmd_requeue, "progress": cmd_progress,
-     "plan-garden": cmd_plan_garden}[args.cmd](args)
+     "plan-garden": cmd_plan_garden, "plan-pets": cmd_plan_pets}[args.cmd](args)
 
 
 if __name__ == "__main__":

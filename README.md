@@ -71,6 +71,26 @@ docker compose run --rm loader status
 docker compose run --rm loader run --platform wb
 ```
 
+### Догрузка сегмента «Товары для животных» (автокормушки и автопоилки, 2020 — 10.08.2026)
+
+WB — предметы «Кормушки для животных» и «Поилки для животных» целиком, Ozon — «Автокормушки и автопоилки
+для кошек» и «…для собак». Списки — `WB_PETS_SUBJECTS`, `OZON_PETS_PATHS` в loader.py. Дублей не будет:
+задание уникально по (площадка, путь, период), строка — по (площадка, SKU, день). Дни товара, уже лежащие
+в другом сегменте, догрузка не перезаписывает (`ISOLATED_SEGMENTS`), так что прежние данные сайта не меняются.
+Сайт во время выгрузки работает: он читает только файл DuckDB.
+
+```bash
+cd ~/projects/mpstats && git pull && docker compose build
+docker compose run --rm loader quota                     # хватает ли квоты (нужно ~100–200 запросов WB)
+docker compose run --rm loader plan-pets                 # 32 задания; повторный запуск ничего не задвоит
+docker compose run --rm loader run --segment "Товары для животных"
+docker compose run --rm loader status                    # ошибки — внизу; упавшие: requeue и снова run
+docker compose run --rm build-db && docker compose restart web
+```
+
+Если `run` прервался (обрыв SSH, перезагрузка) — `requeue`, затем тот же `run`: продолжит с той же страницы.
+Длинную выгрузку удобно запускать в `tmux`/`screen` или через `docker compose run -d --rm loader run …`.
+
 ## Windows (как сейчас)
 
 - `start_web.bat` / `stop_web.bat` — сайт в фоне на http://localhost:8000, лог в `logs/web.log`
