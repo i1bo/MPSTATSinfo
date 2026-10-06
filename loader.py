@@ -9,7 +9,7 @@
   python loader.py test-quota           проверить, списывает ли квоту пагинация
   python loader.py plan-garden          задания сегмента «Сад и дача»
   python loader.py plan-pets            задания сегмента «Товары для животных» (автокормушки, автопоилки)
-  python loader.py run [--limit N] [--platform wb|ozon] [--segment СЕГМЕНТ]
+  python loader.py run [--limit N] [--platform wb|ozon] [--segment garden|pets]
                                         выполнять задания из очереди (можно прерывать и продолжать)
   python loader.py status               сводка по очереди и базе
   python loader.py progress             таблица прогресса по годам
@@ -109,6 +109,9 @@ OZON_PETS_PATHS = [
 # Догружаемые сегменты не перезаписывают дни товара, уже лежащие в другом сегменте
 # (товар мог попасть в выдачу и прежних предметов) — существующие данные сайта не меняются.
 ISOLATED_SEGMENTS = {PETS_SEGMENT}
+
+# короткие латинские имена сегментов для командной строки (на сервере кириллицу набирать неудобно)
+SEGMENT_ALIASES = {"garden": GARDEN_SEGMENT, "pets": PETS_SEGMENT}
 
 
 def wb_garden_subjects():
@@ -610,7 +613,7 @@ def cmd_run(args):
     with pg() as con:
         n = 0
         while not args.limit or n < args.limit:
-            job = claim_job(con, args.platform, args.job, args.segment)
+            job = claim_job(con, args.platform, args.job, SEGMENT_ALIASES.get(args.segment, args.segment))
             if not job:
                 print(f"{tag} очередь пуста")
                 return
@@ -731,7 +734,7 @@ def main():
     p.add_argument("--platform", choices=["wb", "ozon"])
     p.add_argument("--limit", type=int)
     p.add_argument("--job", type=int)
-    p.add_argument("--segment", help="только задания этого сегмента, напр. \"Товары для животных\"")
+    p.add_argument("--segment", help="только задания сегмента: garden, pets или полное название")
     p = sp.add_parser("test-quota")
     p.add_argument("--job", type=int)
     p.add_argument("--page-size", type=int, default=200)

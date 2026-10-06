@@ -83,7 +83,7 @@ WB — предметы «Кормушки для животных» и «Пои
 cd ~/projects/mpstats && git pull && docker compose build
 docker compose run --rm loader quota                     # хватает ли квоты (нужно ~100–200 запросов WB)
 docker compose run --rm loader plan-pets                 # 32 задания; повторный запуск ничего не задвоит
-docker compose run --rm loader run --segment "Товары для животных"
+docker compose run --rm loader run --segment pets
 docker compose run --rm loader status                    # ошибки — внизу; упавшие: requeue и снова run
 docker compose run --rm build-db && docker compose restart web
 ```
