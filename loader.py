@@ -25,6 +25,7 @@ import datetime as dt
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -89,7 +90,7 @@ OZON_GARDEN_PATHS = [
     "Бытовая химия и гигиена/Бытовая химия/Средства от грызунов",
 ]
 # до перестройки дерева Ozon опрыскиватели лежали здесь
-OZON_GARDEN_LEGACY = [("Дом и сад/Цветы и растения/Лейки и опрыскиватели", dt.date(2024, 12, 31))]
+OZON_GARDEN_LEGACY = [("Дом и сад/Цветы и растения/Лейки и опрыскиватели", START, dt.date(2024, 12, 31))]
 
 
 # ---------------------------------------------------------------- сегмент «Товары для животных»
@@ -101,10 +102,34 @@ WB_PETS_SUBJECTS = [
     "Товары для животных / Кормушки для животных",
     "Товары для животных / Поилки для животных",
 ]
-OZON_PETS_PATHS = [
-    "Товары для животных/Товары для кошек/Посуда для кошек/Автокормушки и автопоилки для кошек",
-    "Товары для животных/Товары для собак/Посуда для собак/Автокормушки и автопоилки для собак",
+OZON_PETS_CATS = "Товары для животных/Товары для кошек/Посуда для кошек/Автокормушки и автопоилки для кошек"
+OZON_PETS_DOGS = "Товары для животных/Товары для собак/Посуда для собак/Автокормушки и автопоилки для собак"
+OZON_PETS_PATHS = [OZON_PETS_CATS, OZON_PETS_DOGS]
+# Нынешние пути MPSTATS отдаёт с 2024 года (категория товара берётся на конец периода), раньше — старое дерево:
+# 2023 — свои категории автокормушек; 2020–2022 отдельной категории не было — берём весь раздел и отбираем
+# товары по названию (pet_auto_name). Всё кладём в категории нынешних путей, чтобы на сайте был один ряд.
+# (путь, с, по, категория в базе, отбор по названию)
+OZON_PETS_LEGACY = [
+    ("Товары для животных/Для кошек/Посуда для кошек/Автокормушки и автопоилки",
+     dt.date(2023, 1, 1), dt.date(2023, 12, 31), OZON_PETS_CATS, False),
+    ("Товары для животных/Для собак/Посуда/Автокормушки и автопоилки",
+     dt.date(2023, 1, 1), dt.date(2023, 12, 31), OZON_PETS_DOGS, False),
+    ("Товары для животных/Для кошек", START, dt.date(2022, 12, 31), OZON_PETS_CATS, True),
+    ("Товары для животных/Для собак", START, dt.date(2022, 12, 31), OZON_PETS_DOGS, True),
 ]
+OZON_LEGACY_TARGET = {path: (target, by_name) for path, _, _, target, by_name in OZON_PETS_LEGACY}
+
+# отбор по названию: кормушка/поилка/фонтан/миска + признак автоматики, без птиц, рыб, грызунов и с/х животных
+PET_FEED = re.compile(r"кормушк|кормилк|поилк|поильник|фонтан|миск|диспенсер|дозатор")
+PET_AUTO = re.compile(r"автокорм|автопоил|автомат|фонтан|умн|таймер|wi-?fi|вай-?фай|электрон|программ|камер"
+                      r"|беспровод|usb|насос|помп|датчик")
+PET_OTHER = re.compile(r"птиц|попуга|канаре|\bкур|несуш|бройлер|цыпл|перепел|голуб|рыб|аквариум|грызун|хомяк"
+                       r"|крол|шиншил|хорь|хорек|черепах|рептил|ниппел|пчел|теленк|телят|свин|козл|коз\b")
+
+
+def pet_auto_name(name):
+    n = (name or "").lower().replace("ё", "е")
+    return bool(PET_FEED.search(n) and PET_AUTO.search(n) and not PET_OTHER.search(n))
 
 # Догружаемые сегменты не перезаписывают дни товара, уже лежащие в другом сегменте
 # (товар мог попасть в выдачу и прежних предметов) — существующие данные сайта не меняются.
@@ -352,9 +377,10 @@ def parse_items(job, items):
     est = job["metric"] == "revenue_estimated"
     daily, prods = [], []
     bad_len = 0
+    legacy_target, by_name = OZON_LEGACY_TARGET.get(job["path"], (None, False)) if platform == "ozon" else (None, False)
     for it in items:
         sku = it.get("id")
-        if not sku:
+        if not sku or (by_name and not pet_auto_name(it.get("name"))):
             continue
         if est:
             rev, orders = it.get("revenue_estimated_graph"), it.get("sales_estimated_graph")
@@ -371,7 +397,7 @@ def parse_items(job, items):
             # it["subject"]; у ~0–7% товаров он другой (MPSTATS отдаёт и товары из path_list).
             category = job["path_name"]
         else:
-            category = it.get("niche") or it.get("category") or job["path_name"]
+            category = legacy_target or it.get("niche") or it.get("category") or job["path_name"]
         first = last = None
         for i, v in enumerate(rev):
             if not v:
@@ -686,9 +712,9 @@ def plan_segment(segment, until, subjects, ozon_paths, ozon_legacy=()):
         for path in ozon_paths:
             for d1, d2 in periods(until):
                 jobs.append(("ozon", segment, path, path, d1, d2, "revenue"))
-        for path, legacy_until in ozon_legacy:
+        for path, legacy_since, legacy_until in ozon_legacy:
             for d1, d2 in periods(until):
-                if d2 <= legacy_until:
+                if legacy_since <= d1 and d2 <= legacy_until:
                     jobs.append(("ozon", segment, path, path, d1, d2, "revenue"))
         con.cursor().executemany(
             """INSERT INTO mpstats.load_jobs (platform, segment, path, path_name, d1, d2, metric)
@@ -704,7 +730,8 @@ def cmd_plan_garden(_):
 
 
 def cmd_plan_pets(_):
-    plan_segment(PETS_SEGMENT, PETS_UNTIL, wb_pets_subjects(), OZON_PETS_PATHS)
+    plan_segment(PETS_SEGMENT, PETS_UNTIL, wb_pets_subjects(), OZON_PETS_PATHS,
+                 [(path, since, until) for path, since, until, _, _ in OZON_PETS_LEGACY])
 
 
 def cmd_status(_):
