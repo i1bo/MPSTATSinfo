@@ -25,7 +25,7 @@ web/app.py             сайт (FastAPI), читает только файл Du
 Первый запуск:
 
 ```bash
-git clone <адрес репозитория> ~/mpstats && cd ~/mpstats
+git clone git@github.com:i1bo/MPSTATSinfo.git ~/projects/mpstats && cd ~/projects/mpstats
 cp .env.example .env        # заполнить: WEB_PASSWORD, PG_PASSWORD, PG_DSN (хост db), MPSTATS_TOKEN
 mkdir -p data logs pgdata
 docker compose up -d db     # пустая база; затем перенести дамп (ниже)
@@ -41,13 +41,13 @@ set PGPASSWORD=пароль_локального_postgres
 "%ProgramFiles%\PostgreSQL\16\bin\pg_dump.exe" -h localhost -p 5433 -U postgres -d mpstats -n mpstats -Fc -Z 6 | ssh -p ПОРТ пользователь@сервер "cat > ~/mpstats.dump"
 ```
 
-На сервере:
+На сервере (в один поток: у дампа, переданного через конвейер, нет смещений данных, и `pg_restore -j` на нём падает):
 
 ```bash
-cd ~/mpstats
-docker compose cp ~/mpstats.dump db:/tmp/mpstats.dump
-docker compose exec db pg_restore -U postgres -d mpstats --no-owner -j 4 /tmp/mpstats.dump
-docker compose exec db rm /tmp/mpstats.dump && rm ~/mpstats.dump
+cd ~/projects/mpstats
+docker compose exec -T db pg_restore -U postgres -d mpstats --no-owner -v < ~/mpstats.dump
+docker compose exec db psql -U postgres -d mpstats -c "select count(*) from mpstats.sales_daily"
+rm ~/mpstats.dump
 ```
 
 Обновление кода:
