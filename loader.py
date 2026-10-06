@@ -691,10 +691,16 @@ def cmd_test_quota(args):
                     "daily_rows=0 WHERE job_id=%s", (job["job_id"],))
 
 
-def plan_segment(segment, until, subjects, ozon_paths, ozon_legacy=()):
+def plan_segment(segment, until, subjects, ozon_paths, ozon_legacy=(), ozon_categories=()):
     """Задания сегмента за 2020 — until. Предметы WB, уже загруженные в другом сегменте, не перегружаются —
-    им только меняется сегмент в справочнике. Повторный запуск безопасен: задания уникальны по (площадка, путь, период)."""
+    им только меняется сегмент в справочнике. Повторный запуск безопасен: задания уникальны по (площадка, путь, период).
+    ozon_categories — категории Ozon сегмента: они могли быть заведены раньше другим сегментом (ниша товара из чужой
+    выгрузки), тогда новые строки легли бы в чужой сегмент — переносим их в этот."""
     with pg() as con:
+        if ozon_categories:
+            n = con.execute("UPDATE mpstats.categories SET segment=%s WHERE platform=2 AND name = ANY(%s) "
+                            "AND segment <> %s", (segment, list(ozon_categories), segment)).rowcount
+            print(f"Категорий Ozon перенесено в «{segment}»: {n}")
         loaded = {int(r[0]) for r in con.execute(
             "SELECT DISTINCT path FROM mpstats.load_jobs WHERE platform='wb' AND segment <> %s", (segment,))}
         moved = [sid for sid, _, _ in subjects if sid in loaded]
@@ -731,7 +737,7 @@ def cmd_plan_garden(_):
 
 def cmd_plan_pets(_):
     plan_segment(PETS_SEGMENT, PETS_UNTIL, wb_pets_subjects(), OZON_PETS_PATHS,
-                 [(path, since, until) for path, since, until, _, _ in OZON_PETS_LEGACY])
+                 [(path, since, until) for path, since, until, _, _ in OZON_PETS_LEGACY], OZON_PETS_PATHS)
 
 
 def cmd_status(_):
